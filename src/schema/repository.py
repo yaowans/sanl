@@ -4,7 +4,7 @@ import logging
 import os
 import threading
 from contextlib import contextmanager
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 from .models import Source, Node, CheckJob, NodeStatus, User, Token
 from ..config import get_config
@@ -487,7 +487,7 @@ def init_db():
     with get_connection() as conn:
         # 读取 schema SQL
         schema_path = os.path.join(os.path.dirname(__file__), "schema.sql")
-        with open(schema_path, "r") as f:
+        with open(schema_path, "r", encoding="utf-8") as f:
             schema = f.read()
         conn.executescript(schema)
         _migrate(conn)
@@ -713,6 +713,25 @@ def update_node_location(node_id: int, country: Optional[str] = None, provider: 
         )
 
 
+def mark_nodes_status(node_ids: List[int], status: str) -> int:
+    """批量更新节点状态，返回受影响行数"""
+    if not node_ids:
+        return 0
+    now = int(__import__('time').time())
+    changed = 0
+    with get_connection() as conn:
+        # SQLite 参数上限 999，分批
+        for i in range(0, len(node_ids), 900):
+            chunk = node_ids[i:i + 900]
+            placeholders = ",".join("?" * len(chunk))
+            cur = conn.execute(
+                f"UPDATE nodes SET status = ?, updated_at = ? WHERE id IN ({placeholders})",
+                [status, now] + chunk,
+            )
+            changed += cur.rowcount or 0
+    return changed
+
+
 def get_active_nodes() -> List[Node]:
     return list_nodes(status=NodeStatus.ACTIVE.value)
 
@@ -814,6 +833,162 @@ def toggle_user_active(user_id: int, is_active: int):
     with get_connection() as conn:
         conn.execute("UPDATE users SET is_active = ?, updated_at = ? WHERE id = ?",
                      (is_active, int(__import__('time').time()), user_id))
+
+
+def update_user_password(user_id: int, password_hash: str):
+    with get_connection() as conn:
+        conn.execute("UPDATE users SET password_hash = ?, updated_at = ? WHERE id = ?",
+                     (password_hash, int(__import__('time').time()), user_id))
+
+
+# ===== 会话 CRUD =====
+
+def create_session(session_id: str, user_id: int, username: str,
+                   role: str, expires_at: int):
+    with get_connection() as conn:
+        conn.execute(
+            "INSERT INTO user_sessions (session_id, user_id, username, role, expires_at, created_at) "
+            "VALUES (?, ?, ?, ?, ?, strftime('%s', 'now'))",
+            (session_id, user_id, username, role, expires_at)
+        )
+
+
+def get_session(session_id: str) -> Optional[dict]:
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT * FROM user_sessions WHERE session_id = ?", (session_id,)
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def delete_session(session_id: str):
+    with get_connection() as conn:
+        conn.execute("DELETE FROM user_sessions WHERE session_id = ?", (session_id,))
+
+
+def delete_user_sessions(user_id: int):
+    """禁用账号或改密码后踢掉该用户所有会话"""
+    with get_connection() as conn:
+        conn.execute("DELETE FROM user_sessions WHERE user_id = ?", (user_id,))
+
+
+def purge_expired_sessions() -> int:
+    with get_connection() as conn:
+        cur = conn.execute(
+            "DELETE FROM user_sessions WHERE expires_at < strftime('%s', 'now')"
+        )
+        return cur.rowcount or 0
+
+
+# ===== 登录失败限流 =====
+
+def get_login_fail_state(key: str) -> Optional[dict]:
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT fail_count, last_fail_at FROM login_failures WHERE key = ?", (key,)
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def record_login_fail(key: str):
+    import time as _t
+    with get_connection() as conn:
+        conn.execute(
+            "INSERT INTO login_failures (key, fail_count, last_fail_at) VALUES (?, 1, ?) "
+            "ON CONFLICT(key) DO UPDATE SET fail_count = fail_count + 1, last_fail_at = ?",
+            (key, int(_t.time()), int(_t.time()))
+        )
+
+
+def clear_login_fail(key: str):
+    with get_connection() as conn:
+        conn.execute("DELETE FROM login_failures WHERE key = ?", (key,))
+
+
+# ===== GFW 封锁检测 =====
+
+def save_gfw_check(server: str, port: int, blocked: int, checkable: int,
+                   source: str = "", detail: str = "", latency: Optional[int] = None):
+    """记录一次境内探针结果"""
+    with get_connection() as conn:
+        conn.execute(
+            "INSERT INTO gfw_checks (server, port, blocked, checkable, source, detail, latency) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (server, port, blocked, checkable, source, detail[:500], latency)
+        )
+
+
+def set_node_gfw_status(node_id: int, server: str, port: int, blocked: int,
+                        checkable: int = 1, source: str = ""):
+    """写入节点级 GFW 结论（覆盖式缓存）"""
+    with get_connection() as conn:
+        conn.execute(
+            "INSERT INTO node_gfw_status (node_id, server, port, blocked, checkable, source, checked_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, strftime('%s', 'now')) "
+            "ON CONFLICT(node_id) DO UPDATE SET server=excluded.server, port=excluded.port, "
+            "blocked=excluded.blocked, checkable=excluded.checkable, source=excluded.source, "
+            "checked_at=excluded.checked_at",
+            (node_id, server, port, blocked, checkable, source)
+        )
+
+
+def get_node_gfw_status_map(node_ids: List[int]) -> Dict[int, dict]:
+    """批量取节点 GFW 结论"""
+    if not node_ids:
+        return {}
+    out = {}
+    with get_connection() as conn:
+        # SQLite 参数上限 999，分批查询
+        for i in range(0, len(node_ids), 900):
+            chunk = node_ids[i:i + 900]
+            placeholders = ",".join("?" * len(chunk))
+            rows = conn.execute(
+                f"SELECT * FROM node_gfw_status WHERE node_id IN ({placeholders})", chunk
+            ).fetchall()
+            for r in rows:
+                out[r["node_id"]] = dict(r)
+    return out
+
+
+def list_gfw_blocked_nodes(limit: int = 200) -> List[dict]:
+    """列出被判定为境内不可达的节点"""
+    with get_connection() as conn:
+        rows = conn.execute(
+            "SELECT g.node_id, g.server, g.port, g.blocked, g.source, g.checked_at, "
+            "n.node_name, n.node_type, n.status, n.country, n.latency, n.download_speed "
+            "FROM node_gfw_status g JOIN nodes n ON n.id = g.node_id "
+            "WHERE g.blocked = 1 AND g.checkable = 1 "
+            "ORDER BY g.checked_at DESC LIMIT ?", (limit,)
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def gfw_stats() -> dict:
+    """GFW 检测统计"""
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT COUNT(*) AS total, "
+            "SUM(CASE WHEN blocked=1 THEN 1 ELSE 0 END) AS blocked, "
+            "SUM(CASE WHEN blocked=0 THEN 1 ELSE 0 END) AS reachable "
+            "FROM node_gfw_status"
+        ).fetchone()
+        return {
+            "total": row["total"] or 0,
+            "blocked": row["blocked"] or 0,
+            "reachable": row["reachable"] or 0,
+        }
+
+
+def clear_gfw_status(node_ids: Optional[List[int]] = None):
+    """清除 GFW 结论缓存（node_ids 为空则全清）"""
+    with get_connection() as conn:
+        if node_ids:
+            for i in range(0, len(node_ids), 900):
+                chunk = node_ids[i:i + 900]
+                placeholders = ",".join("?" * len(chunk))
+                conn.execute(f"DELETE FROM node_gfw_status WHERE node_id IN ({placeholders})", chunk)
+        else:
+            conn.execute("DELETE FROM node_gfw_status")
 
 
 # ===== Token CRUD =====

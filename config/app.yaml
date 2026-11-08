@@ -8,12 +8,18 @@ app:
   version: 2.6.2
 database:
   path: ./data/nodes.db
+gfw:
+  enabled: false
+  probe_url: ''
+  probe_key: ''
+  timeout: 3
+  batch_size: 100
 scheduler:
   auto_clean_days: 7
   check_backend: subs-check
-  check_cron: 0 7,14,18 * * *  # 北京时间每天 7:00/14:00/18:00
+  check_cron: 0 7,14,18 * * *
   check_mode: speed
-  fetch_cron: 0 7,14,18 * * *  # 北京时间每天 7:00/14:00/18:00
+  fetch_cron: 0 7,14,18 * * *
   qualified_latency_ms: 800
 sources:
   github:

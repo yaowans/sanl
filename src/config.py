@@ -41,3 +41,22 @@ def get_subs_check_config():
 
 def get_scheduler_config():
     return load_config().get("scheduler", {})
+
+
+def get_gfw_config():
+    """GFW 境内探针配置。
+
+    环境变量优先（便于把探针密钥留在 compose 的 .env 里而不落进 app.yaml）：
+      CN_PROBE_URL / CN_PROBE_KEY / CN_PROBE_ENABLED
+    """
+    cfg = dict(load_config().get("gfw", {}) or {})
+    env_url = os.environ.get("CN_PROBE_URL")
+    env_key = os.environ.get("CN_PROBE_KEY")
+    env_enabled = os.environ.get("CN_PROBE_ENABLED")
+    if env_url:
+        cfg["probe_url"] = env_url
+    if env_key:
+        cfg["probe_key"] = env_key
+    if env_enabled is not None:
+        cfg["enabled"] = env_enabled.lower() in ("1", "true", "yes", "on")
+    return cfg

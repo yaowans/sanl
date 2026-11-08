@@ -263,6 +263,11 @@ class Checker:
                     logger.info(f"Qualified-latency check (>{threshold}ms): {marked} nodes marked inactive")
                 except Exception as qe:
                     logger.warning(f"apply qualified latency failed: {qe}")
+                # GFW 境内可达性复核：境外能连但境内被墙的节点降级为 inactive
+                try:
+                    await self._apply_gfw_filter()
+                except Exception as ge:
+                    logger.warning(f"GFW filter failed: {ge}")
                 # 测速后异步刷新 GeoIP 出口识别（不阻塞返回；外层捕获避免 Future exception 泄漏）
                 import asyncio
                 from ..geoip import refresh_node_geo
@@ -288,6 +293,53 @@ class Checker:
             repository.update_check_job(job_id.id, "failed", error=str(e))
             job.update({"status": "failed", "finished_at": time.time(), "error": str(e)})
             return {"status": "error", "job_id": job_id, "error": str(e)}
+
+    async def _apply_gfw_filter(self) -> Dict:
+        """GFW 境内可达性复核。
+
+        境外服务器测速只能证明"服务器能连上"，但 GFW 会让境内用户连不上。
+        这里调用境内探针复核存活节点：境内不可达的降级为 inactive（不参与默认订阅输出）。
+
+        探针未启用或不可用时直接跳过，不影响原有测速流程。
+        """
+        from ..gfw import check_nodes, probe_enabled
+
+        if not probe_enabled():
+            return {"skipped": True, "reason": "探针未启用"}
+
+        # 只复核本轮判为 active 的节点
+        alive = repository.list_nodes(status="active", limit=5000)
+        if not alive:
+            return {"skipped": True, "reason": "无存活节点"}
+
+        payload = [{"id": n.id, "node_data": n.node_data} for n in alive]
+        task_manager.update(TASK_ID, detail=f"GFW 境内可达性复核（{len(payload)} 个节点）…")
+        results = await check_nodes(payload)
+        if not results:
+            return {"skipped": True, "reason": "探针无响应"}
+
+        blocked_ids = []
+        for nid, r in results.items():
+            repository.save_gfw_check(
+                r["server"], r["port"], 1 if r["blocked"] else 0, 1,
+                source="cn-probe", detail=r.get("error", ""), latency=r.get("latency_ms"),
+            )
+            repository.set_node_gfw_status(
+                nid, r["server"], r["port"], 1 if r["blocked"] else 0, 1, "cn-probe"
+            )
+            if r["blocked"]:
+                blocked_ids.append(nid)
+
+        if blocked_ids:
+            repository.mark_nodes_status(blocked_ids, "inactive")
+            # 被墙节点重新计算评分，避免其高分挤占订阅输出
+            from ..schema.repository import update_node_scores
+            update_node_scores()
+
+        blocked = len(blocked_ids)
+        logger.info(f"GFW filter: {len(results)} checked, {blocked} blocked (境内不可达)")
+        task_manager.update(TASK_ID, detail=f"GFW 复核完成：{blocked} 个节点境内不可达")
+        return {"checked": len(results), "blocked": blocked}
 
     async def _run_engine(self, sources: List, mode: str = "speed",
                           overrides: Optional[Dict] = None) -> Dict:

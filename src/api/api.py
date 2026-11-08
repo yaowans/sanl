@@ -35,7 +35,30 @@ async def lifespan(app: FastAPI):
     # 启动时初始化
     logger.info("Initializing Sanl...")
     repository.init_db()
-    
+
+    # 首次启动：若没有任何账号，用环境变量里的初始管理员凭据建一个
+    try:
+        from ..auth import hash_password
+        from ..schema.repository import list_users
+        if not list_users():
+            u = os.environ.get("SANL_ADMIN_USER", "").strip()
+            p = os.environ.get("SANL_ADMIN_PASSWORD", "").strip()
+            if u and p:
+                if len(p) < 8:
+                    logger.warning("SANL_ADMIN_PASSWORD 太短（<8），未创建初始管理员")
+                else:
+                    repository.create_user(u, hash_password(p), "admin")
+                    logger.info("Created initial admin user: %s", u)
+            else:
+                logger.warning("无账号且未设置 SANL_ADMIN_USER/SANL_ADMIN_PASSWORD，"
+                               "请用 scripts/create_admin.py 创建管理员")
+        # 清理过期会话
+        purged = repository.purge_expired_sessions()
+        if purged:
+            logger.info("Purged %d expired sessions", purged)
+    except Exception as e:
+        logger.warning("admin bootstrap failed: %s", e)
+
     scheduler = Scheduler()
     scheduler.start()
     
@@ -113,6 +136,65 @@ def create_app() -> FastAPI:
     from .edgetunnel import router as edgetunnel_router
     app.include_router(edgetunnel_router, prefix="/api/edgetunnel", tags=["edgetunnel"])
     app.include_router(sub_router, prefix="/sub", tags=["subscription"])
+    from .auth_api import router as auth_router
+    app.include_router(auth_router, prefix="/api/auth", tags=["auth"])
+    from .gfw_api import router as gfw_router
+    app.include_router(gfw_router, prefix="/api/gfw", tags=["gfw"])
+
+    # ===== 鉴权中间件 =====
+    # 管理 API 需要登录会话；订阅短链 /sub/{token}/{fmt} 与订阅内容接口保持开放，
+    # 以免影响 Clash/v2rayN 等客户端拉取。
+    # 面板 HTML 壳照常下发（本身不含数据），前端拿到 401 后渲染登录界面。
+    from ..auth import get_session_user, read_session_cookie
+
+    # 无需登录的 API 路径（相对 /api 前缀）
+    _PUBLIC_API = {
+        "auth/login", "auth/logout", "auth/me",
+        # 订阅内容输出（客户端拉取）
+        "nodes/subscribe", "nodes", "nodes/stats", "ranking", "map", "map/countries",
+        "version", "health", "health/db", "stats/trend", "cache/status",
+        # 转换器是纯函数式的公开工具
+        "convert", "edgetunnel",
+    }
+
+    @app.middleware("http")
+    async def auth_guard(request: Request, call_next):
+        path = request.url.path
+
+        # 订阅短链：/sub/{token}/{fmt} —— 走 Token 鉴权，自身校验
+        if path.startswith("/sub/"):
+            return await call_next(request)
+
+        # 静态资源与 PWA 清单：放行（登录页自身要加载）
+        if (path.startswith("/static/") or path.startswith("/vendor/")
+                or path in ("/sw.js", "/manifest.webmanifest", "/favicon.ico")):
+            return await call_next(request)
+
+        # 登录相关接口：放行
+        if path in ("/api/auth/login", "/api/auth/logout", "/api/auth/me"):
+            return await call_next(request)
+
+        # API 文档暴露接口结构，需登录
+        if path in ("/openapi.json", "/docs"):
+            if not get_session_user(read_session_cookie(request)):
+                return JSONResponse({"detail": "未登录或会话已过期"}, status_code=401)
+            return await call_next(request)
+
+        if path.startswith("/api/"):
+            rel = path[len("/api/"):]
+            # 公开读接口放行；其余 API 一律要求登录
+            if rel in _PUBLIC_API:
+                return await call_next(request)
+            # 令牌接口本身用 Token 机制，不走会话
+            if rel.startswith("tokens") or rel.startswith("token/"):
+                return await call_next(request)
+
+            user = get_session_user(read_session_cookie(request))
+            if not user:
+                return JSONResponse({"detail": "未登录或会话已过期"}, status_code=401)
+            request.state.user = user
+
+        return await call_next(request)
 
     # 缓存失效：任何非只读请求（POST/PUT/DELETE）完成后清空读缓存。
     # 写操作频率远低于读（每小时抓取/测速），清空可保正确且命中率高。

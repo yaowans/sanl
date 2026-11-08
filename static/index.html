@@ -174,6 +174,7 @@
             <div class="logo" style="justify-content:space-between;">🌐 Sanl <span style="display:flex;gap:6px;align-items:center;">
                 <button class="btn btn-sm btn-secondary" id="lang-btn" onclick="toggleLang()" title="Language" style="padding:4px 8px;font-size:12px;">EN</button>
                 <button class="btn btn-sm btn-secondary" id="theme-btn" onclick="toggleTheme()" title="主题" style="padding:4px 8px;font-size:13px;">🌙</button>
+                <button class="btn btn-sm btn-secondary" id="logout-btn" onclick="doLogout()" title="退出登录" style="padding:4px 8px;font-size:12px;display:none;">⏻</button>
               </span></div>
             <nav>
                 <div class="nav-group">📊 总览</div>
@@ -183,6 +184,7 @@
                 <div class="nav-item" data-page="map">🌍 世界地图</div>
                 <div class="nav-item" data-page="sources">📡 来源管理</div>
                 <div class="nav-item" data-page="check">⚡ 测速任务</div>
+                <div class="nav-item" data-page="gfw">🛡 GFW 检测</div>
                 <div class="nav-item" data-page="cfendpoints">☁️ CF 优选</div>
                 <div class="nav-group" i18n-group="sub">🔄 订阅转换</div>
                 <div class="nav-item" data-page="convert">🔄 订阅转换</div>
@@ -202,6 +204,25 @@
         <main class="main" id="main-content"></main>
     </div>
     <div id="toast-container"></div>
+
+    <!-- 登录遮罩层 -->
+    <div id="login-overlay" style="display:none;position:fixed;inset:0;z-index:9999;background:var(--bg);align-items:center;justify-content:center;">
+        <div style="width:360px;max-width:92vw;background:var(--card);border:1px solid var(--bd);border-radius:14px;padding:28px;box-shadow:0 12px 40px rgba(0,0,0,.18);">
+            <div style="text-align:center;margin-bottom:20px;">
+                <div style="font-size:34px;line-height:1;">🌐</div>
+                <div style="font-size:21px;font-weight:700;margin-top:8px;">Sanl</div>
+                <div style="color:var(--mut);font-size:12px;margin-top:4px;" id="login-hint">请登录以访问管理面板</div>
+            </div>
+            <input type="text" id="login-user" placeholder="用户名" autocomplete="username"
+                   style="width:100%;padding:10px 12px;margin-bottom:10px;border:1px solid var(--bd);border-radius:8px;background:var(--bg);color:var(--tx);box-sizing:border-box;">
+            <input type="password" id="login-pass" placeholder="密码" autocomplete="current-password"
+                   style="width:100%;padding:10px 12px;margin-bottom:14px;border:1px solid var(--bd);border-radius:8px;background:var(--bg);color:var(--tx);box-sizing:border-box;">
+            <div id="login-err" style="color:#dc2626;font-size:12px;min-height:16px;margin-bottom:6px;"></div>
+            <button id="login-btn" onclick="doLogin()"
+                    style="width:100%;padding:11px;border:none;border-radius:8px;background:var(--primary);color:#fff;font-weight:600;font-size:14px;cursor:pointer;">登录</button>
+        </div>
+    </div>
+
     <!-- 通用模态框 -->
     <div class="modal" id="modal-overlay">
         <div class="modal-content" id="modal-content"></div>
@@ -211,6 +232,25 @@
         const API = '/api';
         let currentPage = 'dashboard';
         let allNodes = [];
+
+        // 统一 fetch 包装：管理 API 返回 401 时（会话过期）拉起登录遮罩
+        const _rawFetch = window.fetch.bind(window);
+        let _sessionExpiredShown = false;
+        window.fetch = async function (input, init) {
+            const resp = await _rawFetch(input, init);
+            try {
+                const url = typeof input === 'string' ? input : (input && input.url) || '';
+                if (resp.status === 401 && url.startsWith('/api/')
+                        && !url.includes('/auth/') && !url.includes('/subscribe')) {
+                    // 已经处于未登录状态时不重复提示（避免初始加载刷屏）
+                    if (_authUser && !_sessionExpiredShown) {
+                        _sessionExpiredShown = true;
+                        showLoginOverlay('会话已过期，请重新登录');
+                    }
+                }
+            } catch (e) {}
+            return resp;
+        };
 
         // ===== 页面渲染 =====
         function showToast(msg, type = 'success') {
@@ -250,6 +290,7 @@
                 {id:'map', icon:'🌍', zh:'世界地图', en:'Map'},
                 {id:'sources', icon:'📡', zh:'来源管理', en:'Sources'},
                 {id:'check', icon:'⚡', zh:'测速任务', en:'Speed Test'},
+                {id:'gfw', icon:'🛡', zh:'GFW 检测', en:'GFW Check'},
                 {id:'cfendpoints', icon:'☁️', zh:'CF 优选', en:'CF Hub'},
             ]},
             { id:'sub', icon:'🔄', zh:'订阅转换', en:'Subscription', home:'convert', pages:[
@@ -265,6 +306,11 @@
         function moduleOf(page){ return MODULES.find(m => m.home===page || m.pages.some(p=>p.id===page)); }
 
         function renderPage(page) {
+            // 未登录时不渲染面板内容（避免大量 401 请求与控制台报错）
+            if (_authUser === null && _authChecked) {
+                showLoginOverlay();
+                return;
+            }
             if (page === 'cfscan') page = 'cfendpoints';
             const mod = moduleOf(page);
             // 模块内子导航条（多页模块才显示；移动端主要靠它切换）
@@ -283,6 +329,7 @@
                 case 'sources': renderSources(body || main); break;
                 case 'cfendpoints': renderCfEndpoints(body || main); break;
                 case 'check': renderCheck(body || main); break;
+                case 'gfw': renderGfw(body || main); break;
                 case 'convert': renderConvert(body || main); break;
                 case 'cfworker': renderCfWorker(body || main); break;
                 case 'subscribe': renderSubscribe(body || main); break;
@@ -1845,6 +1892,165 @@
         }
 
         // ===== 🔁 订阅转换（第二大功能块） =====
+        // ===== 🛡 GFW 境内可达性检测 =====
+        async function renderGfw(main) {
+            main.innerHTML = `
+                <div class="page-header"><h1 class="page-title">🛡 GFW 境内可达性检测</h1>
+                    <button class="btn btn-secondary" onclick="goPage('gfw')">🔄 刷新</button></div>
+                <div style="background:var(--card);border:1px solid var(--bd);border-radius:10px;padding:14px;margin-bottom:14px;font-size:13px;line-height:1.7;color:var(--text-muted);">
+                    服务器在境外时，境外测速只能证明「服务器能连上」，但 GFW 会让境内用户连不上这些节点。
+                    本页调用部署在<strong>中国大陆境内</strong>的探针服务复核 IP:端口 的境内可达性，把「境外连通但境内被墙」的节点识别出来。
+                </div>
+                <div class="stats-grid" style="grid-template-columns:repeat(auto-fit,minmax(150px,1fr));">
+                    <div class="stat-card"><div class="stat-value" id="gfw-probe-state">—</div><div class="stat-label">探针状态</div></div>
+                    <div class="stat-card"><div class="stat-value" id="gfw-egress">—</div><div class="stat-label">探针出口 IP</div></div>
+                    <div class="stat-card"><div class="stat-value" id="gfw-total">—</div><div class="stat-label">已检测节点</div></div>
+                    <div class="stat-card"><div class="stat-value" id="gfw-blocked">—</div><div class="stat-label">境内不可达</div></div>
+                </div>
+                <div style="display:flex;gap:10px;flex-wrap:wrap;margin:16px 0;">
+                    <button class="btn btn-primary" id="gfw-run-btn" onclick="gfwCheckNodes()">🔍 检测当前可用节点</button>
+                    <button class="btn btn-secondary" onclick="gfwManualCheck()">✏️ 手动检测 IP:端口</button>
+                    <button class="btn btn-secondary" onclick="gfwClearCache()">🗑 清空结论缓存</button>
+                </div>
+                <div id="gfw-msg" style="font-size:13px;margin-bottom:12px;color:var(--text-muted);"></div>
+                <div id="gfw-blocked-box"></div>`;
+            await gfwLoadHealth();
+            await gfwLoadStats();
+        }
+
+        async function gfwLoadHealth() {
+            const st = document.getElementById('gfw-probe-state');
+            const ip = document.getElementById('gfw-egress');
+            try {
+                const d = await (await fetch(`${API}/gfw/health`)).json();
+                if (!d.enabled) {
+                    st.textContent = '未启用'; st.style.color = '#94a3b8';
+                    ip.textContent = '—';
+                    document.getElementById('gfw-msg').innerHTML =
+                        '探针未启用。在 <code>config/app.yaml</code> 的 <code>gfw</code> 段配置 <code>enabled: true</code>、<code>probe_url</code>、<code>probe_key</code>，或用环境变量 <code>CN_PROBE_URL</code> / <code>CN_PROBE_KEY</code> / <code>CN_PROBE_ENABLED</code>。';
+                    return;
+                }
+                if (d.ok) {
+                    st.textContent = '正常'; st.style.color = '#16a34a';
+                    ip.textContent = d.egress_ip || '—';
+                    const cn = /^(\d+\.){3}\d+$/.test(d.egress_ip || '');
+                    document.getElementById('gfw-msg').innerHTML = cn
+                        ? '✅ 探针工作正常。出口 IP 为境内地址，检测结果具备 GFW 判别力。'
+                        : '⚠️ 探针在线，但出口 IP 不像境内地址，检测结果可能无法反映 GFW 拦截情况。';
+                } else {
+                    st.textContent = '异常'; st.style.color = '#dc2626';
+                    ip.textContent = '—';
+                    document.getElementById('gfw-msg').textContent = '探针异常: ' + (d.error || '未知错误');
+                }
+            } catch (e) {
+                st.textContent = '不可达'; st.style.color = '#dc2626';
+                document.getElementById('gfw-msg').textContent = '探针请求失败: ' + e.message;
+            }
+        }
+
+        async function gfwLoadStats() {
+            try {
+                const d = await (await fetch(`${API}/gfw/stats`)).json();
+                document.getElementById('gfw-total').textContent = d.total ?? 0;
+                const b = document.getElementById('gfw-blocked');
+                b.textContent = d.blocked ?? 0;
+                b.style.color = (d.blocked > 0) ? '#dc2626' : '';
+                if (d.total > 0) await gfwLoadBlocked();
+            } catch (e) {}
+        }
+
+        async function gfwLoadBlocked() {
+            const box = document.getElementById('gfw-blocked-box');
+            try {
+                const list = await (await fetch(`${API}/gfw/blocked?limit=200`)).json();
+                if (!list.length) { box.innerHTML = ''; return; }
+                box.innerHTML = `
+                    <div class="page-header" style="margin-top:8px;"><h2 style="font-size:17px;font-weight:700;">🚫 境内不可达节点 (${list.length})</h2></div>
+                    <div style="overflow:auto;border:1px solid var(--bd);border-radius:10px;">
+                    <table style="width:100%;border-collapse:collapse;font-size:13px;">
+                        <thead><tr style="background:var(--card);">
+                            <th style="padding:9px 12px;text-align:left;border-bottom:1px solid var(--bd);">节点</th>
+                            <th style="padding:9px 12px;text-align:left;border-bottom:1px solid var(--bd);">地址</th>
+                            <th style="padding:9px 12px;text-align:left;border-bottom:1px solid var(--bd);">状态</th>
+                            <th style="padding:9px 12px;text-align:left;border-bottom:1px solid var(--bd);">错误</th>
+                        </tr></thead>
+                        <tbody>${list.map(n => `
+                            <tr>
+                                <td style="padding:8px 12px;border-bottom:1px solid var(--bd);">${escHtml(n.node_name || '—')}</td>
+                                <td style="padding:8px 12px;border-bottom:1px solid var(--bd);font-family:ui-monospace,monospace;">${escHtml(n.server)}:${n.port}</td>
+                                <td style="padding:8px 12px;border-bottom:1px solid var(--bd);color:#dc2626;">${escHtml(n.status)}</td>
+                                <td style="padding:8px 12px;border-bottom:1px solid var(--bd);color:var(--text-muted);font-size:12px;">${escHtml(n.detail || '')}</td>
+                            </tr>`).join('')}</tbody>
+                    </table></div>`;
+            } catch (e) {}
+        }
+
+        async function gfwCheckNodes() {
+            const btn = document.getElementById('gfw-run-btn');
+            const msg = document.getElementById('gfw-msg');
+            btn.disabled = true; btn.textContent = '检测中…';
+            msg.textContent = '正在调用境内探针复核可用节点…';
+            try {
+                const d = await (await fetch(`${API}/gfw/check-nodes?limit=1000&apply=true`, {method: 'POST'})).json();
+                if (d.detail) {
+                    msg.textContent = '检测失败: ' + d.detail;
+                } else {
+                    msg.innerHTML = `✅ 检测完成：复核 <b>${d.checked}</b> 个节点，其中 <b style="color:#dc2626">${d.blocked}</b> 个境内不可达（已降级为 inactive，不再进入默认订阅）。`;
+                    await gfwLoadStats();
+                }
+            } catch (e) {
+                msg.textContent = '请求失败: ' + e.message;
+            }
+            btn.disabled = false; btn.textContent = '🔍 检测当前可用节点';
+        }
+
+        async function gfwManualCheck() {
+            const raw = prompt('输入要检测的地址，每行一个（格式 ip:port）:\n例如:\n1.1.1.1:443\n8.8.8.8:53');
+            if (!raw) return;
+            const targets = raw.split(/[\s,;]+/).map(s => s.trim()).filter(Boolean);
+            if (!targets.length) return;
+            const msg = document.getElementById('gfw-msg');
+            msg.textContent = '检测中…';
+            try {
+                const d = await (await fetch(`${API}/gfw/check`, {
+                    method: 'POST', headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({targets})
+                })).json();
+                if (d.detail) { msg.textContent = '检测失败: ' + d.detail; return; }
+                const rows = d.results.map(r => `
+                    <tr>
+                        <td style="padding:7px 12px;border-bottom:1px solid var(--bd);font-family:ui-monospace,monospace;">${escHtml(r.target)}</td>
+                        <td style="padding:7px 12px;border-bottom:1px solid var(--bd);color:${r.reachable ? '#16a34a' : '#dc2626'};">
+                            ${r.reachable ? '✅ 境内可达' : '❌ 境内不可达'}</td>
+                        <td style="padding:7px 12px;border-bottom:1px solid var(--bd);">${r.latency_ms ?? '—'} ms</td>
+                        <td style="padding:7px 12px;border-bottom:1px solid var(--bd);color:var(--text-muted);font-size:12px;">${escHtml(r.error || '')}</td>
+                    </tr>`).join('');
+                document.getElementById('gfw-blocked-box').innerHTML = `
+                    <div style="margin-top:12px;overflow:auto;border:1px solid var(--bd);border-radius:10px;">
+                    <table style="width:100%;border-collapse:collapse;font-size:13px;">
+                        <thead><tr style="background:var(--card);">
+                            <th style="padding:9px 12px;text-align:left;border-bottom:1px solid var(--bd);">目标</th>
+                            <th style="padding:9px 12px;text-align:left;border-bottom:1px solid var(--bd);">结果</th>
+                            <th style="padding:9px 12px;text-align:left;border-bottom:1px solid var(--bd);">延迟</th>
+                            <th style="padding:9px 12px;text-align:left;border-bottom:1px solid var(--bd);">错误</th>
+                        </tr></thead><tbody>${rows}</tbody></table></div>`;
+                msg.textContent = `检测完成：${d.summary.reachable} 可达 / ${d.summary.blocked} 不可达`;
+            } catch (e) {
+                msg.textContent = '请求失败: ' + e.message;
+            }
+        }
+
+        async function gfwClearCache() {
+            if (!confirm('确定清空 GFW 结论缓存？下次测速会重新探测。')) return;
+            try {
+                await fetch(`${API}/gfw/cache`, {method: 'DELETE'});
+                document.getElementById('gfw-msg').textContent = '✅ 缓存已清空';
+                await gfwLoadStats();
+            } catch (e) {
+                document.getElementById('gfw-msg').textContent = '失败: ' + e.message;
+            }
+        }
+
         const CONVERT_FORMATS = [
             {key:'clash', name:'Clash'},
             {key:'clash-meta', name:'Clash.Meta'},
@@ -2337,8 +2543,90 @@
             document.querySelectorAll('#bottom-tab > div').forEach(d => d.classList.toggle('active', d === el));
         }
 
+        // ===== 账号鉴权 =====
+        let _authUser = null;
+        let _authChecked = false;
+
+        function showLoginOverlay(msg) {
+            const ov = document.getElementById('login-overlay');
+            ov.style.display = 'flex';
+            if (msg) document.getElementById('login-err').textContent = msg;
+            const u = document.getElementById('login-user');
+            const p = document.getElementById('login-pass');
+            setTimeout(() => (u.value ? p : u).focus(), 50);
+        }
+
+        function hideLoginOverlay() {
+            document.getElementById('login-overlay').style.display = 'none';
+            document.getElementById('login-err').textContent = '';
+        }
+
+        async function doLogin() {
+            const u = document.getElementById('login-user').value.trim();
+            const p = document.getElementById('login-pass').value;
+            const err = document.getElementById('login-err');
+            const btn = document.getElementById('login-btn');
+            if (!u || !p) { err.textContent = '请输入用户名和密码'; return; }
+            btn.disabled = true; btn.textContent = '登录中…';
+            try {
+                const r = await fetch(`${API}/auth/login`, {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({username: u, password: p})
+                });
+                const d = await r.json().catch(() => ({}));
+                if (!r.ok) {
+                    err.textContent = d.detail || `登录失败 (HTTP ${r.status})`;
+                    btn.disabled = false; btn.textContent = '登录';
+                    return;
+                }
+                _authUser = d.user;
+                _authChecked = true;
+                document.getElementById('login-pass').value = '';
+                hideLoginOverlay();
+                showToast('✅ 登录成功');
+                renderPage(currentPage);
+            } catch (e) {
+                err.textContent = '网络错误: ' + e.message;
+                btn.disabled = false; btn.textContent = '登录';
+            }
+        }
+
+        async function doLogout() {
+            try { await fetch(`${API}/auth/logout`, {method: 'POST'}); } catch (e) {}
+            _authUser = null;
+            location.reload();
+        }
+
+        document.getElementById('login-pass').addEventListener('keydown', e => {
+            if (e.key === 'Enter') doLogin();
+        });
+        document.getElementById('login-user').addEventListener('keydown', e => {
+            if (e.key === 'Enter') document.getElementById('login-pass').focus();
+        });
+
+        // 初始化：先校验登录态，未登录则显示遮罩并拦截后续渲染
+        async function checkAuth() {
+            try {
+                const r = await fetch(`${API}/auth/me`);
+                const d = await r.json();
+                if (d.authenticated) {
+                    _authUser = d.user;
+                    hideLoginOverlay();
+                    const lb = document.getElementById('logout-btn');
+                    if (lb) lb.style.display = '';
+                    renderPage(currentPage);
+                    _authChecked = true;
+                    return true;
+                }
+            } catch (e) {}
+            _authChecked = true;
+            showLoginOverlay();
+            return false;
+        }
+
         // ===== 初始化 =====
-        renderPage('dashboard');
+        checkAuth();
 
         // 版本号动态同步（config/app.yaml → /api/version → logo）
         (async () => {
@@ -2353,6 +2641,7 @@
 
         // 侧边栏状态刷新：立即执行一次，之后每 30 秒刷新
         async function refreshSidebarStats() {
+            if (!_authUser) return;   // 未登录时跳过，避免无谓的 401
             try {
                 const stats = await (await fetch(`${API}/nodes/stats`)).json();
                 const el = document.getElementById('total-nodes');
@@ -2371,8 +2660,7 @@
             } catch(e) {}
         }
         refreshSidebarStats();
-        setInterval(refreshSidebarStats, 10000);  // 刷新提速：30s→10s
-    </script>
+        setInterval(refreshSidebarStats, 10000);  // 刷新提速：30s→10s    </script>
 <nav id="bottom-tab">
     <div data-page="dashboard" onclick="btGo(this)">📊<span i18n="m_dashboard">仪表盘</span></div>
     <div data-page="nodes" onclick="btGo(this)">🧩<span i18n="m_pool">节点池</span></div>
@@ -2386,6 +2674,7 @@
 let _gtShown = new Set();   // 已通知过的完成任务 id
 let _gtTimer = null;
 async function pollGlobalTasks() {
+    if (!_authUser) { _gtTimer = setTimeout(pollGlobalTasks, 10000); return; }
     let hasActive = false;
     try {
         const d = await (await fetch(`${API}/tasks`)).json();
