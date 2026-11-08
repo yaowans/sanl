@@ -15,24 +15,29 @@ fi
 
 ARCH="$(uname -m)"
 case "$ARCH" in
-    x86_64)  SUFFIX="linux-amd64" ;;
-    aarch64|arm64) SUFFIX="linux-arm64" ;;
+    x86_64)  ASSET="Linux_x86_64" ;;
+    aarch64|arm64) ASSET="Linux_aarch64" ;;
     *) echo "❌ 不支持的架构: $ARCH"; exit 1 ;;
 esac
 
 if [ "$VERSION" = "latest" ]; then
-    URL="https://github.com/${REPO}/releases/latest/download/subs-check-${SUFFIX}.tar.gz"
+    URL="https://github.com/${REPO}/releases/latest/download/subs-check_${ASSET}.tar.gz"
 else
-    URL="https://github.com/${REPO}/releases/download/${VERSION}/subs-check-${SUFFIX}.tar.gz"
+    URL="https://github.com/${REPO}/releases/download/${VERSION}/subs-check_${ASSET}.tar.gz"
 fi
 
 echo "⬇️  下载 $URL"
 TMP="$(mktemp -d)"
-curl -fsSL "$URL" | tar -xz -C "$TMP"
+trap 'rm -rf "$TMP"' EXIT
 
-FOUND="$(find "$TMP" -type f -name 'subs-check*' | head -1)"
+# GitHub 大文件下载偶发 5xx/504，重试若干次再放弃
+curl -fsSL --retry 5 --retry-delay 3 --retry-all-errors --connect-timeout 20 \
+     -o "$TMP/subs-check.tar.gz" "$URL"
+
+tar -xzf "$TMP/subs-check.tar.gz" -C "$TMP"
+
+FOUND="$(find "$TMP" -type f -name 'subs-check*' ! -name '*.tar.gz' | head -1)"
 [ -z "$FOUND" ] && { echo "❌ 压缩包中未找到 subs-check"; exit 1; }
 
 mv "$FOUND" "$BIN" && chmod +x "$BIN"
-rm -rf "$TMP"
 echo "✅ 安装完成: $BIN ($("$BIN" --version 2>/dev/null || echo 'unknown'))"

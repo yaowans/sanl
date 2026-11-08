@@ -797,6 +797,7 @@ async def get_subscribe(
 ):
     """获取多格式订阅链接（10 种格式 × 协议/状态/速度/延迟/分类多维筛选）"""
     from .subscribe import generate_by_format, EXPORT_CONTENT_TYPES
+    from ..gfw import probe_enabled
 
     if status == "all":
         # 全池导出（含 unknown/inactive），按评分降序、未测节点殿后
@@ -810,6 +811,15 @@ async def get_subscribe(
             limit=limit, country=country, min_score=min_score,
             node_type=proto, source_type=src, category=category
         )
+
+    # GFW 复核：探针启用时，默认订阅只输出「境内确认可达」的节点。
+    # 理由：境外测速只能证明服务器能连上；GFW 拦截的节点对国内用户毫无意义，
+    # 且未通过境内复核的节点（未测通 / 未知）同样不应出现在默认订阅里。
+    if probe_enabled() and nodes and status != "all":
+        gfw = repository.get_node_gfw_status_map([n.id for n in nodes])
+        verified = {nid for nid, g in gfw.items()
+                    if g.get("checkable", 1) and not g.get("blocked")}
+        nodes = [n for n in nodes if n.id in verified]
 
     # 内存过滤 min_speed / max_latency
     if min_speed is not None:

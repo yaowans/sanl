@@ -303,6 +303,10 @@ class Checker:
         探针未启用或不可用时直接跳过，不影响原有测速流程。
         """
         from ..gfw import check_nodes, probe_enabled
+        from ..utils.taskmgr import task_manager
+
+        # 与 run_check 中使用的任务 ID 保持一致（该处为函数内局部变量）
+        TASK_ID = "check"
 
         if not probe_enabled():
             return {"skipped": True, "reason": "探针未启用"}
@@ -331,6 +335,8 @@ class Checker:
                 blocked_ids.append(nid)
 
         if blocked_ids:
+            # 降级为 inactive（存活但境内不可用）。订阅接口会额外按 GFW 结论过滤，
+            # 这样既不动 banned（手动封禁）语义，又能保证默认订阅不含被墙节点。
             repository.mark_nodes_status(blocked_ids, "inactive")
             # 被墙节点重新计算评分，避免其高分挤占订阅输出
             from ..schema.repository import update_node_scores

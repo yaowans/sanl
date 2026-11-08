@@ -11,11 +11,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
+# 下载 subs-check 二进制（独立层：项目代码变动不会触发重新下载 117MB）
+# 脚本需留在 scripts/ 下——它按自身路径定位安装目录（INSTALL_DIR=dirname/..）
+COPY scripts/install_subscheck.sh ./scripts/install_subscheck.sh
+RUN chmod +x scripts/install_subscheck.sh && ./scripts/install_subscheck.sh
+
 # 项目代码
 COPY . .
-
-# 下载 subs-check 二进制
-RUN chmod +x scripts/install_subscheck.sh && ./scripts/install_subscheck.sh
 
 # 数据与输出目录
 RUN mkdir -p data output
