@@ -51,7 +51,11 @@ CHECK_MODES = {
         "rename-node": True,
         "download-timeout": 6,
         "download-mb": 1,
-        "min-speed": 128,   # 256→128：存活但中速的节点也算可用（免费池本就稀缺，128KB/s 可满足基础代理）
+        # ⚠ min-speed=0：存活节点全部入库为 active（速度实测值照存）。
+        #   之前 128 会让 subs-check 丢掉低速存活节点——与手工测速(min-speed=0)口径打架：
+        #   手工测速存 21 个 active，全量测速一来 19 个被降级，节点状态反复横跳。
+        #   低速节点的过滤交给订阅侧（min_speed 参数）与合格延迟判定，不在测速层删。
+        "min-speed": 0,
     },
     "full": {
         "label": "全量(含流媒体)",
@@ -59,7 +63,7 @@ CHECK_MODES = {
         "rename-node": True,
         "download-timeout": 6,
         "download-mb": 1,
-        "min-speed": 128,
+        "min-speed": 0,
     },
 }
 # 允许通过 API 覆盖的 subs-check 参数白名单

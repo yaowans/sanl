@@ -734,11 +734,18 @@ async def import_all_sources():
         try:
             summary = await run_pool_import()
             logger.info(f"手动全量导入完成: {summary}")
+            # 新节点入库后自动测速（同 fetch-all 的理由：unknown 不应等下一轮定时）
+            if summary.get("inserted", 0) > 0:
+                try:
+                    logger.info(f"Auto check triggered: {summary['inserted']} new nodes imported")
+                    await scheduler.checker.run_check(trigger="scheduled", mode="speed")
+                except Exception as ce:
+                    logger.warning(f"Auto check after import failed: {ce}")
         except Exception as e:
             logger.error(f"手动全量导入失败: {e}")
 
     asyncio.create_task(_job())
-    return {"status": "started", "message": "全量导入已在后台启动，稍后刷新页面查看各源节点数"}
+    return {"status": "started", "message": "全量导入已在后台启动，抓完自动测速，稍后刷新页面查看"}
 
 
 @api_router.post("/sources/{source_id}/reimport")
@@ -1513,7 +1520,12 @@ async def fetch_single_source(source_id: int, trigger_check: bool = False):
     except Exception as e:
         result = {"status": "failed", "error": str(e)[:200]}
 
-    if trigger_check and result.get("status") == "ok":
+    # 有新节点入库（且未显式传 trigger_check）→ 自动测速，避免 unknown 滞留
+    if result.get("status") == "ok" and summary.get("inserted", 0) > 0 and not trigger_check:
+        import asyncio
+        asyncio.create_task(scheduler.checker.run_check())
+        result["check_triggered"] = True
+    elif trigger_check and result.get("status") == "ok":
         import asyncio
         asyncio.create_task(scheduler.checker.run_check())
         result["check_triggered"] = True
@@ -1851,8 +1863,13 @@ async def get_tasks():
 
 
 @api_router.post("/sources/fetch-all")
-async def fetch_all_sources_now(background: BackgroundTasks):
-    """立即触发全量源抓取（不等每6h定时；新导入的源马上验证可用性）"""
+async def fetch_all_sources_now(background: BackgroundTasks, auto_check: bool = Query(
+        True, description="抓取完成后自动触发一轮全量测速（新增 unknown 节点立即定级）")):
+    """立即触发全量源抓取（不等每6h定时；新导入的源马上验证可用性）
+
+    auto_check=true 时抓取完成自动跑一轮测速——否则新入库节点会停留在
+    status=unknown 最长 6 小时（等下一轮定时测速），用户看到"unknown 没反应"。
+    """
     from ..scheduler.pool_importer import run_pool_import
     from ..scraper.scraper import Scraper
 
@@ -1861,10 +1878,18 @@ async def fetch_all_sources_now(background: BackgroundTasks):
         try:
             summary = await run_pool_import(sc)
             logger.info(f"Manual fetch-all done: {summary.get('sources_ok', 0)} ok / {summary.get('sources_failed', 0)} failed")
+            # 有新节点入库且本轮抓取成功 → 自动测速，把 unknown 立即定级
+            if auto_check and summary.get("inserted", 0) > 0:
+                try:
+                    logger.info(f"Auto check triggered: {summary['inserted']} new nodes imported")
+                    await scheduler.checker.run_check(trigger="scheduled", mode="speed")
+                except Exception as ce:
+                    logger.warning(f"Auto check after fetch failed: {ce}")
         finally:
             await sc.close()
     background.add_task(_job)
-    return {"status": "ok", "message": "全量抓取已启动，稍后刷新查看各源节点数"}
+    msg = "全量抓取已启动" + ("，抓完自动测速" if auto_check else "") + "，稍后刷新查看各源节点数"
+    return {"status": "ok", "message": msg}
 
 
 # ===== 源站 API 代理 =====
