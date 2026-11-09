@@ -517,6 +517,88 @@ async def rename_node(node_id: int, req: RenameNodeRequest):
     return {"status": "ok", "id": node_id, "node_name": name}
 
 
+class ManualCheckRequest(BaseModel):
+    ids: List[int] = Field(default_factory=list, description="要测速的节点 id 列表")
+    mode: str = Field("latency", description="latency=仅延迟 / speed=延迟+速度")
+    rename: bool = Field(True, description="测速后是否按地区规范化命名")
+    refresh_geo: bool = Field(True, description="测速前是否补齐地区信息")
+
+
+class RefreshInfoRequest(BaseModel):
+    ids: List[int] = Field(default_factory=list, description="要刷新的节点 id 列表；为空表示全部")
+    rename: bool = Field(True, description="是否按地区规范化命名")
+    limit: int = Field(500, ge=1, le=5000, description="不指定 ids 时最多处理多少个")
+
+
+@api_router.post("/nodes/manual-check")
+async def manual_check_nodes(req: ManualCheckRequest, background_tasks: BackgroundTasks):
+    """节点手工测速（只测选中的节点，不影响其他节点状态）"""
+    if not req.ids:
+        raise HTTPException(status_code=400, detail="ids 不能为空")
+    if len(req.ids) > 500:
+        raise HTTPException(status_code=400, detail="单次最多测速 500 个节点")
+    if req.mode not in ("latency", "speed"):
+        raise HTTPException(status_code=400, detail="mode must be latency|speed")
+
+    from ..utils.taskmgr import task_manager
+    tid = "manual-check"
+    task_manager.start(tid, "⚡ 手工测速")
+
+    async def _run():
+        try:
+            from ..manual_check import run_manual_check
+            result = await run_manual_check(
+                req.ids, mode=req.mode,
+                progress_cb=lambda ph, d, t, det: task_manager.update(
+                    tid, phase=ph, done=d, total=t, detail=det))
+            detail = (f"完成：{result.get('alive', 0)} 存活 / "
+                      f"{result.get('blocked', 0)} 不可用")
+            task_manager.update(tid, detail=detail)
+            task_manager.finish(tid)
+        except Exception as e:
+            task_manager.finish(tid, error=str(e)[:120])
+            logger.error(f"手工测速失败: {e}")
+
+    background_tasks.add_task(_run)
+    return {"status": "started", "count": len(req.ids),
+            "message": "手工测速已启动，稍后刷新查看结果"}
+
+
+@api_router.post("/nodes/refresh-info")
+async def refresh_node_info(req: RefreshInfoRequest):
+    """补齐节点信息：地区（国家/国家码/城市）+ 按地区规范化命名 + 修复 Reality 参数
+
+    不指定 ids 时处理全库缺地区信息的节点（上限 limit）。
+    """
+    from ..manual_check import fill_geo_for_nodes, normalize_manual_names
+    from ..api.importer import repair_reality_opts
+
+    if req.ids:
+        nodes = repository.get_nodes_by_ids(req.ids)
+        if not nodes:
+            raise HTTPException(status_code=404, detail="节点不存在")
+    else:
+        nodes = repository.list_nodes_missing_geo_all(limit=req.limit)
+        if not nodes:
+            # 没有缺地区的，但可能仍缺 custom_name 之外的信息 → 仍走一遍命名规范化
+            from ..schema.repository import list_nodes
+            nodes = list_nodes(limit=req.limit, sort="score", order="desc")
+
+    # 修复存量节点的 Reality 参数字段名（public-key/short-id → pbk/sid）
+    reality_fixed = repair_reality_opts(nodes)
+
+    geo_updated = await fill_geo_for_nodes(nodes)
+    renamed = 0
+    if req.rename:
+        nodes = repository.get_nodes_by_ids([n.id for n in nodes])
+        renamed = normalize_manual_names(nodes)
+
+    invalidate_all()
+    return {"status": "ok", "processed": len(nodes),
+            "geo_updated": geo_updated, "renamed": renamed,
+            "reality_fixed": reality_fixed}
+
+
 @api_router.delete("/nodes/{node_id}")
 async def delete_node(node_id: int):
     """删除单个节点（硬删除 + 指纹墓碑，下轮抓取不会复活）"""

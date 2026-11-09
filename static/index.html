@@ -489,6 +489,8 @@
                         <button class="btn btn-secondary" onclick="exportNodes('csv')">CSV</button>
                         <button class="btn btn-secondary" onclick="exportNodes('json')">JSON</button>
                         <button class="btn btn-danger" id="node-batch-del-btn" onclick="batchDeleteNodes()" disabled>🗑 删除选中 (0)</button>
+                        <button class="btn btn-primary" id="node-manual-check-btn" onclick="manualCheckSelected()" disabled>⚡ 手工测速选中 (0)</button>
+                        <button class="btn btn-secondary" onclick="refreshAllNodeInfo()">🌍 补齐全部地区信息</button>
                         <button class="btn btn-danger" onclick="deleteUnavailableNodes()">⚡ 清理不可用节点</button>
                         <div class="nf-cols-dd" id="nf-cols-dd" style="position:relative;display:inline-block;">
                             <button type="button" class="btn btn-secondary" id="nf-cols-btn" style="display:inline-flex;align-items:center;gap:6px;user-select:none;cursor:pointer;">⚙️ 列显隐 <span style="font-size:11px;opacity:.6;">▾</span></button>
@@ -752,13 +754,71 @@
             } catch(e) { showToast('重命名失败: ' + (e.message||'网络错误'), 'error'); }
         }
 
+        // ===== ⚡ 手工测速（只测选中节点，不影响其他节点）=====
+        async function manualCheckSelected() {
+            const ids = Array.from(_nodeSelected);
+            if (!ids.length) { showToast('请先选择要测速的节点', 'error'); return; }
+            if (!confirm(`对选中的 ${ids.length} 个节点做手工测速？\n\n· 只测这些节点，不扫全池\n· 只更新这些节点的状态，其他节点不受影响\n· 同时补齐地区信息并按地区规范化命名（已自定义命名的不动）`)) return;
+            showToast(`⚡ 手工测速已启动（${ids.length} 个节点）…`);
+            try {
+                const r = await (await fetch(`${API}/nodes/manual-check`, {
+                    method: 'POST', headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({ids, mode: 'latency', rename: true, refresh_geo: true})
+                })).json();
+                if (r.detail) { showToast('启动失败: ' + r.detail, 'error'); return; }
+                // 轮询任务状态
+                _manualCheckPoll(ids);
+            } catch(e) { showToast('启动失败: ' + (e.message||'网络错误'), 'error'); }
+        }
+
+        function _manualCheckPoll(ids) {
+            let tries = 0;
+            const timer = setInterval(async () => {
+                tries++;
+                if (tries > 120) { clearInterval(timer); return; }   // 最多等 6 分钟
+                try {
+                    const d = await (await fetch(`${API}/tasks`)).json();
+                    const t = (d.active || []).find(x => x.name && x.name.includes('手工测速'));
+                    if (!t) {
+                        clearInterval(timer);
+                        showToast('✅ 手工测速完成，正在刷新节点列表…', 'success');
+                        _nodeSelected.clear();
+                        updateNodeBatchDelBtn();
+                        loadNodes();
+                        return;
+                    }
+                } catch(e) {}
+            }, 3000);
+        }
+
+        // ===== 🌍 补齐地区信息 + 规范化命名 =====
+        async function refreshAllNodeInfo() {
+            if (!confirm('补齐全库节点的地区信息（国家/国家码/城市）并按地区规范化命名？\n\n· 已自定义命名的节点不会被改名\n· GeoIP 查询走 ip-api 免费接口，节点多时需要一点时间')) return;
+            showToast('正在补齐地区信息…');
+            try {
+                const r = await (await fetch(`${API}/nodes/refresh-info`, {
+                    method: 'POST', headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({ids: [], rename: true, limit: 500})
+                })).json();
+                if (r.detail) { showToast('失败: ' + r.detail, 'error'); return; }
+                showToast(`✅ 已处理 ${r.processed} 个节点：补齐地区 ${r.geo_updated} 个，重命名 ${r.renamed} 个`, 'success');
+                loadNodes();
+            } catch(e) { showToast('失败: ' + (e.message||'网络错误'), 'error'); }
+        }
+
         // ===== 节点删除（多选 / 单删 / 一键清理不可用）=====
         function updateNodeBatchDelBtn() {
             const btn = document.getElementById('node-batch-del-btn');
-            if (!btn) return;
+            const ck = document.getElementById('node-manual-check-btn');
             const n = _nodeSelected.size;
-            btn.disabled = n === 0;
-            btn.textContent = `🗑 删除选中 (${n})`;
+            if (btn) {
+                btn.disabled = n === 0;
+                btn.textContent = `🗑 删除选中 (${n})`;
+            }
+            if (ck) {
+                ck.disabled = n === 0;
+                ck.textContent = `⚡ 手工测速选中 (${n})`;
+            }
         }
 
         function toggleNodeSelect(id, checked) {

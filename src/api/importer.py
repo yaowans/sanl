@@ -99,14 +99,17 @@ def _parse_vlike_tls(query: dict, data: dict):
     """vless/trojan/hy2/tuic 共用的 query → node_data 字段"""
     q = {k: v[0] for k, v in query.items() if v}
     security = q.get("security", "")
-    if security == "tls" or q.get("sni"):
+    # ⚠ reality 必须先判：reality 链接同时带 security=reality 和 sni=...，
+    #   若先判 sni 会落入 tls 分支，reality-opts 永远提取不到（实测导致 Reality 节点全部测活失败）
+    if security == "reality" or q.get("pbk"):
+        data["tls"] = True
+        data["reality-opts"] = {"pbk": q.get("pbk", ""), "sid": q.get("sid", "")}
+        if q.get("sni"): data["sni"] = q["sni"]
+        if q.get("host"): data["servername"] = q["host"]
+    elif security == "tls" or q.get("sni"):
         data["tls"] = True
         if q.get("sni"): data["sni"] = q["sni"]
         if q.get("host"): data["servername"] = q["host"]
-    elif security == "reality":
-        data["tls"] = True
-        data["reality-opts"] = {k: q[k] for k in ("pbk", "sid") if k in q}
-        if q.get("sni"): data["sni"] = q["sni"]
     if q.get("flow"): data["flow"] = q["flow"]
     if q.get("type") == "ws":
         data["network"] = "ws"
@@ -438,8 +441,46 @@ def _from_clash_proxies(proxies: list) -> List[Tuple[str, dict, str]]:
             continue
         ptype = str(p.get("type", "")).lower()
         name = p.pop("name", None) or f"{ptype}-{p['server']}"
+        # Reality 参数：Clash 用 public-key/short-id，内部统一用 pbk/sid
+        # （不统一的话，导出的 vless 链接会缺 reality 参数 → 客户端握手必失败）
+        ro = p.get("reality-opts") or p.get("reality_opts")
+        if isinstance(ro, dict):
+            pbk = ro.get("pbk") or ro.get("public-key") or ro.get("public_key")
+            sid = ro.get("sid") or ro.get("short-id") or ro.get("short_id")
+            if pbk or sid:
+                p["reality-opts"] = {"pbk": pbk or "", "sid": sid or ""}
         out.append((ptype, p, str(name)))
     return out
+
+
+def repair_reality_opts(nodes) -> int:
+    """修复存量节点的 reality-opts 字段名（历史数据存的是 public-key/short-id）
+
+    返回修复数量。老节点的 reality 参数其实一直存在，只是字段名不统一导致
+    导出时读不到 → 客户端拿到的 vless 链接缺 pbk/sid → Reality 握手必失败。
+    """
+    import json as _json
+    fixed = 0
+    for n in nodes or []:
+        d = n.node_data if isinstance(n.node_data, dict) else {}
+        ro = d.get("reality-opts") or d.get("reality_opts")
+        if not isinstance(ro, dict):
+            continue
+        if ro.get("pbk") and ro.get("sid"):
+            continue   # 已是内部格式
+        pbk = ro.get("public-key") or ro.get("public_key") or ro.get("pbk") or ""
+        sid = ro.get("short-id") or ro.get("short_id") or ro.get("sid") or ""
+        if not pbk and not sid:
+            continue
+        d["reality-opts"] = {"pbk": pbk, "sid": sid}
+        n.node_data = d
+        try:
+            from ..schema.repository import update_node_data
+            if update_node_data(n.id, d):
+                fixed += 1
+        except Exception:
+            continue
+    return fixed
 
 
 # ---------- Sing-box JSON ----------

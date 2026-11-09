@@ -300,8 +300,9 @@ def _clash_tls(nd: dict, p: dict):
         p["alpn"] = nd["alpn"] if isinstance(nd["alpn"], list) else [nd["alpn"]]
     if nd.get("client-fingerprint"):
         p["client-fingerprint"] = nd["client-fingerprint"]
-    if nd.get("reality-opts"):
-        p["reality-opts"] = nd["reality-opts"]
+    ro = _reality_opts(nd)
+    if ro.get("pbk") or ro.get("sid"):
+        p["reality-opts"] = {"public-key": ro["pbk"], "short-id": ro["sid"]}
 
 
 # ============ Links（v2ray/base64/txt 共用） ============
@@ -318,6 +319,20 @@ def generate_links(nodes: List[Node]) -> str:
         except Exception:
             continue
     return "\n".join(lines)
+
+
+def _reality_opts(nd: dict) -> dict:
+    """取 Reality 参数，兼容两种字段名：
+    - Clash 格式：reality-opts: {public-key, short-id}
+    - sing-box 格式：reality-opts: {pbk, sid}（importer 转换时写入）
+    两者都要能读，否则 Reality 节点导出的订阅缺参数 → 客户端握手必失败。
+    """
+    ro = nd.get("reality-opts") or nd.get("reality_opts") or {}
+    if not isinstance(ro, dict):
+        return {}
+    pbk = ro.get("pbk") or ro.get("public-key") or ro.get("public_key") or ""
+    sid = ro.get("sid") or ro.get("short-id") or ro.get("short_id") or ""
+    return {"pbk": pbk, "sid": sid}
 
 
 def _to_link(n: Node) -> str:
@@ -361,17 +376,17 @@ def _to_link(n: Node) -> str:
         return f"vmess://{base64.b64encode(json.dumps(v, separators=(',', ':')).encode()).decode()}"
     if ptype == "vless":
         qs = {}
+        ro = _reality_opts(nd)
         if nd.get("network"): qs["type"] = nd["network"]
-        qs["security"] = "reality" if nd.get("reality-opts") else ("tls" if nd.get("tls") or nd.get("servername") else "none")
+        qs["security"] = "reality" if ro.get("pbk") else ("tls" if nd.get("tls") or nd.get("servername") else "none")
         if nd.get("sni"): qs["sni"] = nd["sni"]
         if nd.get("servername") and "sni" not in qs: qs["sni"] = nd["servername"]
         if nd.get("flow"): qs["flow"] = nd["flow"]
         if nd.get("ws-path") or nd.get("path"): qs["path"] = nd.get("ws-path") or nd.get("path")
         if nd.get("host"): qs["host"] = nd["host"]
         if nd.get("grpc-service-name"): qs["serviceName"] = nd["grpc-service-name"]
-        if nd.get("reality-opts"):
-            for k in ("pbk", "sid"):
-                if k in nd["reality-opts"]: qs[k] = nd["reality-opts"][k]
+        if ro.get("pbk"): qs["pbk"] = ro["pbk"]
+        if ro.get("sid"): qs["sid"] = ro["sid"]
         if nd.get("alpn"): qs["alpn"] = ",".join(nd["alpn"]) if isinstance(nd["alpn"], list) else nd["alpn"]
         q = "&".join(f"{k}={v}" for k, v in qs.items() if v)
         return f"vless://{nd.get('uuid','')}@{server}:{port}?{q}" if q else f"vless://{nd.get('uuid','')}@{server}:{port}"
@@ -587,8 +602,10 @@ def _sbox_tls(nd: dict, ob: dict):
         elif nd.get("servername"): to["server_name"] = nd["servername"]
         if nd.get("alpn"): to["alpn"] = nd["alpn"] if isinstance(nd["alpn"], list) else [nd["alpn"]]
         if nd.get("skip-cert-verify"): to["insecure"] = True
-        if nd.get("reality-opts"):
-            to["reality"] = {"enabled": True, "public_key": nd["reality-opts"].get("pbk", ""), "short_id": nd["reality-opts"].get("sid", "")}
+        ro = _reality_opts(nd)
+        if ro.get("pbk") or ro.get("sid"):
+            to["reality"] = {"enabled": True, "public_key": ro.get("pbk", ""),
+                             "short_id": ro.get("sid", "")}
         ob["tls"] = to
 
 

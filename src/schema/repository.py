@@ -266,35 +266,60 @@ def upsert_nodes_bulk(items: List[dict]) -> dict:
             "skipped": skipped}
 
 
-def mark_missing_inactive(active_fps: set, include_manual: bool = False):
+def mark_missing_inactive(active_fps: set, include_manual: bool = False,
+                          scope_fingerprints: Optional[set] = None):
     """把不在 active_fps 里的节点置为 inactive（默认只处理自动抓取节点，手动导入永不降级）
 
     自动黑名单（大纲 H.3）：fail_count 连续累计，连续 3 轮未存活 → status='dead'
     （dead 不再参与测速/订阅；节点重新被抓到时 fail_count 归零自动复活）
+
+    ⚠ scope_fingerprints：限定作用域。子集测速（手工测速）必须传，
+      否则全池没参与本轮测速的节点会被误降级成 inactive。
+      作用域内的**手动节点也要处理**——手工测速的就是手动节点，
+      所以传了作用域时不再套用 manual_filter。
     """
-    if not active_fps:
-        return 0
     fps = list(active_fps)[:20000]
-    placeholders = ",".join("?" * len(fps))
-    manual_filter = "" if include_manual else \
+    scope_list = None
+    scope_filter = ""
+    if scope_fingerprints is not None:
+        scope_list = list(scope_fingerprints)[:20000]
+        if not scope_list:
+            return 0
+        scope_filter = " AND fingerprint IN (" + ",".join("?" * len(scope_list)) + ")"
+    # active_fps 为空时 SQL 会出现 "NOT IN ()" 语法错误 → 用恒假条件代替
+    # （语义一致：没有存活节点 → 作用域内全部降级）
+    if fps:
+        placeholders = ",".join("?" * len(fps))
+        not_in = f"fingerprint NOT IN ({placeholders})"
+    else:
+        not_in = "1=1"
+    # 作用域内连手动节点一起处理（手工测速的目标就是手动节点）
+    manual_filter = "" if (include_manual or scope_list is not None) else \
         " AND (source_id IS NULL OR source_id NOT IN (SELECT id FROM sources WHERE source_type = 'manual'))"
     now = int(__import__('time').time())
     with get_connection() as conn:
         # 关键修复：unknown（入库后从未存活）也必须降级——否则测过的死节点永远停在 unknown，
         # 统计失真（曾出现 unknown=7417 占全池 84% 的失真状态），fail_count 也永不累计
+        params = [now] + fps
+        if scope_list is not None:
+            params += scope_list
         cur = conn.execute(
             f"""UPDATE nodes SET status = 'inactive',
                    fail_count = fail_count + 1,
                    updated_at = ?
-                WHERE status IN ('active', 'unknown') AND fingerprint NOT IN ({placeholders}){manual_filter}""",
-            [now] + fps
+                WHERE status IN ('active', 'unknown') AND {not_in}
+                {manual_filter}{scope_filter}""",
+            params
         )
         n = cur.rowcount
         # 连续 3 轮失败 → 自动黑名单（dead）
+        dead_params = [now]
+        if scope_list is not None:
+            dead_params += scope_list
         dead = conn.execute(
             f"""UPDATE nodes SET status = 'dead', updated_at = ?
-                WHERE status = 'inactive' AND fail_count >= 3{manual_filter}""",
-            (now,))
+                WHERE status = 'inactive' AND fail_count >= 3{manual_filter}{scope_filter}""",
+            dead_params)
         n_dead = dead.rowcount
         if n_dead:
             import logging
@@ -303,12 +328,16 @@ def mark_missing_inactive(active_fps: set, include_manual: bool = False):
     return n
 
 
-def apply_check_results(results: List[dict]) -> dict:
+def apply_check_results(results: List[dict], scope_fingerprints: Optional[set] = None) -> dict:
     """
     测速结果回填（不删任何节点）。
     results: [{node_type, node_data, node_name, download_speed?, latency?, country?}]
     来自 subs-check all.yaml 的存活节点。匹配指纹 → status=active + 指标更新；
     未匹配的旧 active → inactive（仅 auto 源，手动导入永不降级）。
+
+    ⚠ scope_fingerprints：指定作用域时，"未匹配→inactive"的降级只在该作用域内生效。
+      子集测速（手工测速选中节点）必须传这个，否则全池没参与测速的节点会被误降级。
+
     返回 {alive, marked_inactive}
     """
     now = int(__import__('time').time())
@@ -352,7 +381,10 @@ def apply_check_results(results: List[dict]) -> dict:
         conn.commit()
 
     fps = {node_fingerprint(r["node_type"], r["node_data"]) for r in results}
-    marked = mark_missing_inactive(fps)
+    if scope_fingerprints is not None:
+        marked = mark_missing_inactive(fps, scope_fingerprints=scope_fingerprints)
+    else:
+        marked = mark_missing_inactive(fps)
     return {"alive": alive, "marked_inactive": marked}
 
 
@@ -817,12 +849,17 @@ def count_source_tombstones() -> int:
 # ===== Node CRUD =====
 
 def add_node(subscribe_url: str, source_id: Optional[int], node_name: str, node_type: str, node_data: dict, status: Optional[str] = None) -> Node:
+    node_status = status or NodeStatus.UNKNOWN.value
+    # ⚠ 必须算指纹：否则 fingerprint=NULL，作用域限定（按 fingerprint 过滤）会漏掉该节点，
+    #   且唯一索引（fingerprint 唯一）也无法防止重复插入
+    fp = node_fingerprint(node_type, node_data)
     with get_connection() as conn:
-            node_status = status or NodeStatus.UNKNOWN.value
             cursor = conn.execute(
-                """INSERT INTO nodes (subscribe_url, source_id, node_name, node_type, node_data, status)
-                   VALUES (?, ?, ?, ?, ?, ?)""",
-                (subscribe_url, source_id, node_name, node_type, json.dumps(node_data), node_status)
+                """INSERT INTO nodes (subscribe_url, source_id, node_name, node_type,
+                                      node_data, status, fingerprint)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (subscribe_url, source_id, node_name, node_type, json.dumps(node_data),
+                 node_status, fp)
             )
             node_id = cursor.lastrowid
             return get_node(node_id)
@@ -943,6 +980,24 @@ def rename_node(node_id: int, new_name: str) -> bool:
         conn.execute(
             "UPDATE nodes SET node_name = ?, node_data = ?, updated_at = ? WHERE id = ?",
             (name, json.dumps(data, ensure_ascii=False), int(__import__('time').time()), node_id)
+        )
+    return True
+
+
+def update_node_data(node_id: int, node_data: dict) -> bool:
+    """更新节点的 node_data（保留 custom_name 等本地标记）"""
+    with get_connection() as conn:
+        row = conn.execute("SELECT node_data FROM nodes WHERE id = ?", (node_id,)).fetchone()
+        if not row:
+            return False
+        old = _parse_node_data(row["node_data"])
+        # 保留本地标记（自定义名不能被覆盖掉）
+        if old.get("custom_name") and not node_data.get("custom_name"):
+            node_data = dict(node_data)
+            node_data["custom_name"] = old["custom_name"]
+        conn.execute(
+            "UPDATE nodes SET node_data = ?, updated_at = ? WHERE id = ?",
+            (json.dumps(node_data, ensure_ascii=False), int(__import__('time').time()), node_id)
         )
     return True
 
@@ -1754,6 +1809,42 @@ def list_manual_node_ids() -> List[int]:
             "SELECT id FROM nodes WHERE source_id IN "
             "(SELECT id FROM sources WHERE source_type = 'manual')").fetchall()
         return [r[0] for r in rows]
+
+
+def get_nodes_by_ids(node_ids: List[int]) -> List[Node]:
+    """按 id 取节点（手工测速的子集加载）"""
+    if not node_ids:
+        return []
+    ids = list(dict.fromkeys(int(i) for i in node_ids))
+    out: List[Node] = []
+    with get_connection() as conn:
+        for i in range(0, len(ids), 900):
+            chunk = ids[i:i + 900]
+            placeholders = ",".join("?" * len(chunk))
+            rows = conn.execute(
+                f"SELECT * FROM nodes WHERE id IN ({placeholders})", chunk).fetchall()
+            for r in rows:
+                d = dict(r)
+                d['node_data'] = _parse_node_data(d.get('node_data'))
+                out.append(Node(**d))
+    return out
+
+
+def list_nodes_missing_geo_all(limit: int = 300) -> List[Node]:
+    """所有状态里 GeoIP 信息缺失的节点（手工测速补地区用，不限 active）"""
+    with get_connection() as conn:
+        rows = conn.execute(
+            "SELECT * FROM nodes WHERE (country IS NULL OR country='' "
+            "OR country_code IS NULL OR country_code='') "
+            "ORDER BY id ASC LIMIT ?",
+            (limit,),
+        ).fetchall()
+        nodes = []
+        for r in rows:
+            d = dict(r)
+            d['node_data'] = _parse_node_data(d.get('node_data'))
+            nodes.append(Node(**d))
+        return nodes
 
 
 def list_countries() -> list:
