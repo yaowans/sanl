@@ -724,7 +724,7 @@ class Checker:
                 emoji_match = re.search(r'[\U0001F1E6-\U0001F1FF]{2}', parts[0])
                 if emoji_match:
                     country = emoji_match.group(0)
-                for p in parts[1:3]:
+                for p in parts[1:5]:  # 段位兼容：{旗}{CC}_{i}|{IP}|{延迟}ms|{速度}
                     if p.endswith('KB/s'):
                         try:
                             download_speed = int(float(p[:-4]) * 1024)
@@ -737,7 +737,7 @@ class Checker:
                             break
                         except ValueError:
                             pass
-                for p in parts[1:4]:
+                for p in parts[1:5]:  # 段位兼容：IP 段可能挤后延迟/速度位置
                     digits = p.replace('ms', '').strip()
                     if digits.isdigit():
                         latency = int(digits)

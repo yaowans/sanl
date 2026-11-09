@@ -1002,6 +1002,30 @@ def update_node_data(node_id: int, node_data: dict) -> bool:
     return True
 
 
+def set_node_auto_name(node_id: int, new_name: str) -> bool:
+    """系统自动命名（区别于用户重命名）。
+
+    - 只更新 node_name，**不盖 custom_name 戳**——否则自动名会变成"用户自定义名"，
+      下一次规范化/测速回填时被跳过，名字永远停在旧值（实测踩过）
+    - node_data.auto_name 记录自动名，便于区分与再生成
+    """
+    name = (new_name or "").strip()
+    if not name:
+        return False
+    with get_connection() as conn:
+        row = conn.execute("SELECT node_data FROM nodes WHERE id = ?", (node_id,)).fetchone()
+        if not row:
+            return False
+        data = _parse_node_data(row["node_data"])
+        data["auto_name"] = name
+        conn.execute(
+            "UPDATE nodes SET node_name = ?, node_data = ?, updated_at = ? WHERE id = ?",
+            (name, json.dumps(data, ensure_ascii=False),
+             int(__import__('time').time()), node_id)
+        )
+    return True
+
+
 def list_custom_named_nodes() -> Dict[int, str]:
     """所有带自定义名的节点 {node_id: custom_name}（回填时优先使用）"""
     out: Dict[int, str] = {}

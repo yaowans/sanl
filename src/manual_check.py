@@ -41,6 +41,8 @@ ProgressCb = Optional[Callable[[str, int, int, str], None]]
 WORKDIR = "./output/manual"
 # 本地订阅服务端口（避开 subs-check 的 8199 与内核的 7891+）
 LOCAL_SUB_PORT = 8765
+# 域名 → IP 解析缓存（命名用；进程内共享）
+_dns_cache: Dict[str, str] = {}
 
 
 def build_links(nodes) -> List[str]:
@@ -62,14 +64,16 @@ def build_links(nodes) -> List[str]:
 
 
 def build_clash_yaml(nodes) -> str:
-    """节点列表 → Clash YAML（无损：reality-opts 等复杂字段完整保留）
+    """节点列表 → Clash.Meta YAML（无损：reality-opts 等复杂字段完整保留）
 
+    ⚠ 必须用 clash-meta 而非基础 clash：基础版会**直接跳过 hysteria2/hysteria/tuic**
+      协议（generate_clash 里过滤），导致这些节点根本不进测速（实测存活 0、无延迟）。
     ⚠ 不能用协议链接代替：vless:// 链接的 reality 参数在往返中会丢，
       Reality 节点必然握手失败（实测存活=0）。Clash YAML 是原始字段，无损。
     """
     from .api.subscribe import generate_by_format
     try:
-        return generate_by_format("clash", list(nodes))
+        return generate_by_format("clash-meta", list(nodes))
     except Exception as e:
         logger.warning(f"[manual] Clash YAML 生成失败: {e}")
         return ""
@@ -119,14 +123,40 @@ async def fill_geo_for_nodes(nodes) -> int:
     return updated
 
 
-def normalize_manual_names(nodes) -> int:
-    """规范化手动节点命名：{国旗}{国家码}_{序号}
+def normalize_manual_names(nodes, include_ip: bool = True) -> int:
+    """规范化手动节点命名：{国旗}{国家码}_{序号}|{IP}|{速度}
+
+    示例：🇯🇵JP_1|49.212.231.67|452KB/s（速度来自最近一次测速，无则省略该段）
+    IP 采用解析后的真实出口（域名先转 IP）；带延迟时格式为
+    {国旗}{国家码}_{序号}|{IP}|{延迟}ms|{速度}。
 
     只处理**没有用户自定义名**的节点（custom_name 优先，不覆盖用户命名）。
     """
+    import re as _re
     from .engine.namer import flag_of
     counter: Dict[str, int] = {}
     updated = 0
+
+    def _resolve(server: str) -> str:
+        """域名 → IP（带缓存；失败返回原值）"""
+        import ipaddress
+        try:
+            ipaddress.ip_address(server)
+            return server
+        except (ValueError, TypeError):
+            pass
+        cached = _dns_cache.get(server)
+        if cached:
+            return cached
+        try:
+            import socket
+            ip = socket.getaddrinfo(server, None, proto=socket.IPPROTO_TCP)[0][4][0]
+            _dns_cache[server] = ip
+            return ip
+        except Exception:
+            _dns_cache[server] = server
+            return server
+
     for n in nodes:
         d = n.node_data if isinstance(n.node_data, dict) else {}
         if d.get("custom_name"):
@@ -145,10 +175,23 @@ def normalize_manual_names(nodes) -> int:
         key = code
         counter[key] = counter.get(key, 0) + 1
         flag = flag_of(code) or "🌐"
-        new_name = f"{flag}{code}_{counter[key]}"
+        parts = [f"{flag}{code}_{counter[key]}"]
+        if include_ip:
+            server = str(d.get("server") or "").strip()
+            if server:
+                parts.append(_resolve(server))
+        # 延迟/速度段（测速后回填的值；subs-check 回填解析按 | 分段提取 KB/s、ms）
+        if n.latency:
+            parts.append(f"{int(n.latency)}ms")
+        elif getattr(n, "download_speed", None):
+            sp = int(n.download_speed)
+            parts.append(f"{sp/1024:.0f}KB/s" if sp < 1048576 else f"{sp/1048576:.1f}MB/s")
+        new_name = "|".join(parts)
         if new_name == (n.node_name or ""):
             continue
-        if repository.rename_node(n.id, new_name):
+        # ⚠ 用 set_node_auto_name 而非 rename_node：自动名不能盖 custom_name 戳，
+        #   否则下一次规范化会把自动名当"用户自定义名"跳过，名字永远停在旧值
+        if repository.set_node_auto_name(n.id, new_name):
             updated += 1
     return updated
 
@@ -229,7 +272,7 @@ def _parse_subs_output(path: str) -> List[dict]:
             m = re.search(r"[\U0001F1E6-\U0001F1FF]{2}", parts[0])
             if m:
                 country = m.group(0)
-            for p in parts[1:3]:
+            for p in parts[1:5]:  # 段位兼容：{旗}{CC}_{i}|{IP}|{延迟}ms|{速度}
                 if p.endswith("KB/s"):
                     try:
                         download_speed = int(float(p[:-4]) * 1024)
@@ -242,7 +285,7 @@ def _parse_subs_output(path: str) -> List[dict]:
                         break
                     except ValueError:
                         pass
-            for p in parts[1:4]:
+            for p in parts[1:5]:  # 段位兼容：IP 段可能挤后延迟/速度位置
                 digits = p.replace("ms", "").strip()
                 if digits.isdigit():
                     latency = int(digits)

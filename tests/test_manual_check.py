@@ -95,9 +95,10 @@ print("  重命名数:", renamed)
 with repository.get_connection() as conn:
     names = {r["id"]: r["node_name"] for r in conn.execute("SELECT id,node_name FROM nodes")}
 print("  名称:", names)
-assert names[n1.id] == "🇦🇺AU_1", names
-assert names[n2.id] == "🇯🇵JP_1", names
-print("  ✓ 按地区规范化命名成功")
+# 新格式：{旗}{CC}_{i}|{IP}
+assert names[n1.id] == "🇦🇺AU_1|vpn-au-001.example.com", names
+assert names[n2.id] == "🇯🇵JP_1|1.2.3.4", names
+print("  ✓ 按地区+IP 规范化命名成功")
 
 # 重复调用不应重复改名（序号稳定）
 nodes = repository.get_nodes_by_ids([n1.id, n2.id])
