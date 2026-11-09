@@ -1071,6 +1071,7 @@
                         <select class="form-input" id="src-filter-state" style="width:150px;" onchange="renderSourcesTable()">
                             <option value="all">全部状态</option>
                             <option value="healthy">仅健康</option>
+                            <option value="failed">仅抓取失败</option>
                             <option value="unhealthy">仅异常</option>
                             <option value="pending">仅待抓取</option>
                         </select>
@@ -1080,6 +1081,7 @@
                             <input type="checkbox" id="src-show-disabled" onchange="renderSourcesTable()"> 显示已禁用
                         </label>
                         <button class="btn btn-secondary" onclick="renderSourcesTable()">🔍 筛选</button>
+                        <button class="btn btn-primary" id="src-batch-fetch-btn" onclick="fetchSelectedSources()" disabled>🚀 抓取选中 (0)</button>
                         <button class="btn btn-danger" id="src-batch-del-btn" onclick="batchDeleteSources()" disabled>🗑 删除选中 (0)</button>
                     </div>
                     <div class="table-container"><table><thead><tr>
@@ -1670,6 +1672,7 @@
                 const stest = s.speed_test === undefined || s.speed_test === null ? 1 : s.speed_test;
                 const badge = st === 'healthy' ? '<span class="badge badge-success">健康</span>'
                             : st === 'pending' ? '<span class="badge badge-info">待抓取</span>'
+                            : st === 'failed' ? `<span class="badge badge-danger">抓取失败×${s.fail_count||1}</span>`
                             : `<span class="badge badge-danger">异常${(s.fail_count||0) >= 3 ? '×'+s.fail_count : ''}</span>`;
                 const checked = _srcSelected.has(s.id) ? ' checked' : '';
                 const disabledTag = s.enabled ? '' : ' <span class="badge badge-secondary">已禁用</span>';
@@ -1692,11 +1695,53 @@
         }
 
         function updateBatchDeleteBtn() {
-            const btn = document.getElementById('src-batch-del-btn');
-            if (!btn) return;
+            const delBtn = document.getElementById('src-batch-del-btn');
+            const fetchBtn = document.getElementById('src-batch-fetch-btn');
             const n = _srcSelected.size;
-            btn.disabled = n === 0;
-            btn.textContent = `🗑 删除选中 (${n})`;
+            if (delBtn) {
+                delBtn.disabled = n === 0;
+                delBtn.textContent = `🗑 删除选中 (${n})`;
+            }
+            if (fetchBtn) {
+                fetchBtn.disabled = n === 0;
+                fetchBtn.textContent = `🚀 抓取选中 (${n})`;
+            }
+        }
+
+        // ===== 🚀 手动抓取选中的源（逐个同步抓取，实时反馈结果）=====
+        async function fetchSelectedSources() {
+            const ids = Array.from(_srcSelected);
+            if (!ids.length) { showToast('请先选择要抓取的数据源', 'error'); return; }
+            const btn = document.getElementById('src-batch-fetch-btn');
+            const names = _srcAll.filter(s => _srcSelected.has(s.id)).map(s => s.name);
+            if (!confirm(`手动抓取选中的 ${ids.length} 个数据源？\n\n${names.slice(0,5).join('\n')}${names.length > 5 ? '\n…' : ''}\n\n（同步执行，抓完逐个显示结果）`)) return;
+            btn.disabled = true; btn.textContent = '⏳ 抓取中…';
+            let ok = 0, failed = 0;
+            const failNames = [];
+            for (const id of ids) {
+                try {
+                    const r = await (await fetch(`${API}/sources/${id}/fetch`, {method:'POST'})).json();
+                    if (r.status === 'ok') {
+                        ok++;
+                        showToast(`✅ ${r.source}：解析 ${r.parsed} 个节点（新增 ${r.inserted}）`, 'success');
+                    } else if (r.status === 'already_running') {
+                        showToast('⚠ 已有测速任务在跑，请稍后再试', 'error');
+                        break;
+                    } else {
+                        failed++; failNames.push(r.source || `源#${id}`);
+                        showToast(`❌ ${r.source || '源#'+id}：${r.error || '抓取失败'}`, 'error');
+                    }
+                } catch(e) {
+                    failed++; failNames.push(`源#${id}`);
+                }
+            }
+            btn.disabled = false;
+            updateBatchDeleteBtn();
+            _srcSelected.clear();
+            const all = document.getElementById('src-select-all');
+            if (all) all.checked = false;
+            if (ids.length > 1) showToast(`🚀 批量抓取完成：${ok} 成功 / ${failed} 失败${failNames.length ? '（' + failNames.join('、') + '）' : ''}`, failed ? 'error' : 'success');
+            loadSources();
         }
 
         function toggleSourceSelect(id, checked) {

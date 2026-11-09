@@ -1512,7 +1512,12 @@ def update_node_geo(node_id: int, country: str, country_code: str, city: str = "
 
 
 def record_source_failure(source_id: int, auto_disable_threshold: int = 5, disable_hours: int = 24):
-    """记录源抓取失败；连续失败达到阈值自动禁用 N 小时（附录 G 防劣化）"""
+    """记录源抓取失败；连续失败达到阈值自动禁用 N 小时（附录 G 防劣化）
+
+    ⚠ 同时把 last_status 置 2（抓取失败）：之前只累加 fail_count 不动 last_status，
+      失败源的 last_status 停在 0，前端把它显示成「待抓取」——
+      实际已抓取且失败，用户看到"一直待抓取"以为抓取没执行（实测踩过）。
+    """
     now = int(__import__('time').time())
     with get_connection() as conn:
         row = conn.execute("SELECT fail_count FROM sources WHERE id = ?", (source_id,)).fetchone()
@@ -1522,12 +1527,13 @@ def record_source_failure(source_id: int, auto_disable_threshold: int = 5, disab
         if fail_count >= auto_disable_threshold:
             # 禁用 disable_hours 小时（用 updated_at 存禁用时间，恢复时判断）
             conn.execute(
-                "UPDATE sources SET fail_count = ?, enabled = 0, updated_at = ? WHERE id = ?",
+                "UPDATE sources SET fail_count = ?, enabled = 0, last_status = 2, updated_at = ? WHERE id = ?",
                 (fail_count, now, source_id)
             )
             logger.warning(f"Source #{source_id} auto-disabled after {fail_count} failures (re-enable after {disable_hours}h)")
         else:
-            conn.execute("UPDATE sources SET fail_count = ? WHERE id = ?", (fail_count, source_id))
+            conn.execute("UPDATE sources SET fail_count = ?, last_status = 2, updated_at = ? WHERE id = ?",
+                         (fail_count, now, source_id))
 
 
 def record_source_success(source_id: int):

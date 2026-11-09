@@ -1783,16 +1783,21 @@ async def raw_import_source(raw_data: RawImportSource):
 @cached(ttl=5)
 async def get_sources_health():
     """获取数据源健康度报告
-    状态语义（修复：原逻辑把 last_status==0 未抓取当健康必要条件，导致正常源全标红）：
-    - last_status=0 → pending 待抓取（新源尚未轮到调度，中性状态）
+    状态语义：
     - last_status=1 且启用 → healthy 健康（最近一次抓取成功）
-    - 启用但 fail_count>=3 或禁用 → unhealthy 异常
+    - last_status=2 → failed 抓取失败（区分于 pending，前端显示具体错误而非"待抓取"）
+    - last_status=0 且 fail_count<3 → pending 待抓取（新源尚未轮到调度，中性状态）
+    - 其余（启用但 fail_count>=3 / 禁用）→ unhealthy 异常
     """
     sources = repository.list_sources(enabled_only=False)
     health = []
     for s in sources:
         if s.enabled == 1 and s.last_status == 1:
             state = "healthy"
+        elif s.last_status == 2:
+            state = "failed"
+        elif s.enabled == 0:
+            state = "unhealthy"     # 已禁用（含失败禁用/手动删除）≠ 待抓取
         elif s.last_status == 0 and (s.fail_count or 0) < 3:
             state = "pending"
         else:
