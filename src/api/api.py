@@ -59,6 +59,23 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning("admin bootstrap failed: %s", e)
 
+    # 回收僵死的测速任务：容器重启/崩溃时 running 状态会永久残留，
+    # 前端进度条会一直显示"运行中"。启动时把这类行标记为失败。
+    try:
+        with repository.get_connection() as conn:
+            stale = conn.execute(
+                "SELECT id FROM check_jobs WHERE status IN ('running', 'pending')"
+            ).fetchall()
+            for row in stale:
+                repository.update_check_job(
+                    row["id"], "failed",
+                    error="任务因服务重启中断（启动时自动回收）"
+                )
+        if stale:
+            logger.warning("Reaped %d stale check job(s) left running by a restart", len(stale))
+    except Exception as e:
+        logger.warning("stale job reaper failed: %s", e)
+
     scheduler = Scheduler()
     scheduler.start()
     
@@ -255,7 +272,11 @@ async def create_source(source: SourceCreate):
 @api_router.get("/sources", response_model=List[models.Source])
 @cached(ttl=3)
 async def list_sources(enabled: bool = True, include_manual: bool = False):
-    """获取数据源列表（默认排除 manual 手动导入/测试类——它们不是真实来源）"""
+    """获取数据源列表。
+
+    enabled=false 时返回全部源（含已禁用）——来源管理页需要展示并筛选异常/已禁用的源。
+    默认排除 manual 手动导入/测试类——它们不是真实来源。
+    """
     items = repository.list_sources(enabled_only=enabled)
     if not include_manual:
         items = [s for s in items if (s.source_type or "") != "manual"]
@@ -281,6 +302,25 @@ async def delete_source(source_id: int):
     """删除数据源"""
     repository.enable_source(source_id, 0)  # 软删除
     return {"status": "ok"}
+
+
+class BatchSourceIds(BaseModel):
+    ids: List[int] = Field(..., description="要删除的数据源 id 列表")
+
+
+@api_router.post("/sources/batch-delete")
+async def batch_delete_sources(payload: BatchSourceIds):
+    """批量删除数据源（软删除：置为禁用，不破坏历史节点数据）
+
+    与单条删除一致，只是不再逐个往返。
+    """
+    if not payload.ids:
+        raise HTTPException(status_code=400, detail="ids 不能为空")
+    if len(payload.ids) > 500:
+        raise HTTPException(status_code=400, detail="单次最多删除 500 个源")
+    ids = list(dict.fromkeys(int(i) for i in payload.ids))  # 去重保序
+    repository.disable_sources(ids)
+    return {"status": "ok", "deleted": len(ids)}
 
 
 # ===== 手动导入（订阅链接/节点链接/单节点表单）=====
@@ -410,6 +450,69 @@ async def unban_node(node_id: int):
         raise HTTPException(status_code=404, detail="节点不存在")
     invalidate_all()  # 订阅缓存失效
     return {"status": "ok", "id": node_id, "banned": False}
+
+
+class BatchNodeIds(BaseModel):
+    ids: List[int] = Field(..., description="要删除的节点 id 列表")
+
+
+class DeleteByStatus(BaseModel):
+    statuses: List[str] = Field(default_factory=lambda: ["inactive", "dead"],
+                                description="要删除的节点状态列表")
+
+
+@api_router.delete("/nodes/{node_id}")
+async def delete_node(node_id: int):
+    """删除单个节点（硬删除 + 指纹墓碑，下轮抓取不会复活）"""
+    res = repository.delete_nodes([node_id])
+    if not res["deleted"]:
+        raise HTTPException(status_code=404, detail="节点不存在")
+    invalidate_all()
+    return {"status": "ok", "deleted": res["deleted"], "tombstoned": res["tombstoned"]}
+
+
+@api_router.post("/nodes/batch-delete")
+async def batch_delete_nodes(payload: BatchNodeIds):
+    """批量删除节点（硬删除 + 指纹墓碑）"""
+    if not payload.ids:
+        raise HTTPException(status_code=400, detail="ids 不能为空")
+    if len(payload.ids) > 20000:
+        raise HTTPException(status_code=400, detail="单次最多删除 20000 个节点")
+    res = repository.delete_nodes(payload.ids)
+    invalidate_all()
+    return {"status": "ok", "deleted": res["deleted"], "tombstoned": res["tombstoned"]}
+
+
+@api_router.post("/nodes/delete-by-status")
+async def delete_nodes_by_status(payload: DeleteByStatus):
+    """一键删除指定状态的节点（默认清理 inactive + dead 等不可用节点）"""
+    if not payload.statuses:
+        raise HTTPException(status_code=400, detail="statuses 不能为空")
+    ids = repository.list_node_ids_by_status(payload.statuses)
+    if not ids:
+        return {"status": "ok", "deleted": 0, "tombstoned": 0}
+    res = repository.delete_nodes(ids)
+    invalidate_all()
+    return {"status": "ok", "deleted": res["deleted"], "tombstoned": res["tombstoned"]}
+
+
+@api_router.get("/nodes/tombstones")
+async def list_node_tombstones(limit: int = Query(200, ge=1, le=2000)):
+    """已删除节点记录（墓碑），可据此恢复被误删的节点"""
+    return {"status": "ok", "total": repository.count_tombstones(),
+            "items": repository.list_tombstones(limit)}
+
+
+@api_router.post("/nodes/tombstones/restore")
+async def restore_node_tombstones(payload: BatchNodeIds):
+    """撤销删除：清除指纹墓碑，节点将在下轮抓取时重新入库
+
+    fingerprints 为空表示全部撤销。
+    """
+    fps = [str(f) for f in payload.ids if f]
+    n = repository.restore_tombstones(fps)
+    invalidate_all()
+    return {"status": "ok", "restored": n}
 
 
 @api_router.post("/sources/discover")
@@ -1329,23 +1432,15 @@ async def get_country_list():
 
 # 预置免费节点源
 PRESET_SOURCES = [
-    {"name": "Pawdroid/Free-servers", "url": "https://raw.githubusercontent.com/Pawdroid/Free-servers/main/clash.yml", "type": "github"},
-    {"name": "mahdibland/V2RayAggregator", "url": "https://raw.githubusercontent.com/mahdibland/V2RayAggregator/master/sub/sub_merge_base64.txt", "type": "github"},
-    {"name": "free-nodes/clashfree", "url": "https://raw.githubusercontent.com/free-nodes/clashfree/main/clash.yml", "type": "github"},
-    {"name": "snakem982/proxypool", "url": "https://raw.githubusercontent.com/snakem982/proxypool/main/source/freenode", "type": "github"},
-    {"name": "mermeroo/V2RAY-CLASH-BASE64", "url": "https://raw.githubusercontent.com/mermeroo/V2RAY-CLASH-BASE64/main/sub.txt", "type": "github"},
-    {"name": "xiaoji235/airport-free", "url": "https://raw.githubusercontent.com/xiaoji235/airport-free/main/sub.txt", "type": "github"},
-    {"name": "paidki/FreeNodes", "url": "https://raw.githubusercontent.com/paidki/FreeNodes/main/sub.txt", "type": "github"},
-    {"name": "pepslsub/free", "url": "https://raw.githubusercontent.com/pepslsub/free/main/sub", "type": "github"},
-    {"name": "Alvin9999/pac2", "url": "https://raw.githubusercontent.com/Alvin9999/pac2/master/clash.meta.yaml", "type": "github"},
-    {"name": "ripaojiedian/freenode", "url": "https://raw.githubusercontent.com/ripaojiedian/freenode/main/clash.yaml", "type": "github"},
-    {"name": "chengdoudou/free-node", "url": "https://raw.githubusercontent.com/chengdoudou/free-node/main/clash.txt", "type": "github"},
-    {"name": "RUNBLACK/clashnode", "url": "https://raw.githubusercontent.com/RUNBLACK/clashnode/main/clashnode.yml", "type": "github"},
-    {"name": "zlccccc/ProxyPool", "url": "https://raw.githubusercontent.com/zlccccc/ProxyPool/main/sub/sub_merge.txt", "type": "github"},
-    {"name": "aiboboxx/clashfree", "url": "https://raw.githubusercontent.com/aiboboxx/clashfree/main/clash.yml", "type": "github"},
-    {"name": "huyz2023/free-proxy", "url": "https://raw.githubusercontent.com/huyz2023/free-proxy/main/sub.txt", "type": "github"},
-    {"name": "LancelotRar/best-cf-ipv4", "url": "https://raw.githubusercontent.com/LancelotRar/best-cf-ips/main/best-cf-ipv4.txt", "type": "github"},
-    {"name": "LancelotRar/best-cf-domain", "url": "https://raw.githubusercontent.com/LancelotRar/best-cf-ips/main/best-cf-domain.txt", "type": "github"},
+    # ===== 代理订阅源（2026-11-09 实测可达；此前 14 个 GitHub 源已 404 失效）=====
+    {"name": "mahdibland/V2RayAggregator-base64", "url": "https://raw.githubusercontent.com/mahdibland/V2RayAggregator/master/sub/sub_merge_base64.txt", "type": "github"},
+    {"name": "mahdibland/V2RayAggregator-clash", "url": "https://raw.githubusercontent.com/mahdibland/V2RayAggregator/master/sub/sub_merge.txt", "type": "github"},
+    {"name": "mahdibland/V2RayAggregator-yaml", "url": "https://raw.githubusercontent.com/mahdibland/V2RayAggregator/master/sub/sub_merge_yaml.yml", "type": "github"},
+    {"name": "ermaozi/get_subscribe-clash", "url": "https://raw.githubusercontent.com/ermaozi/get_subscribe/main/subscribe/clash.yml", "type": "github"},
+    {"name": "ermaozi/get_subscribe-v2ray", "url": "https://raw.githubusercontent.com/ermaozi/get_subscribe/main/subscribe/v2ray.txt", "type": "github"},
+    {"name": "peasoft/NoMoreWalls", "url": "https://raw.githubusercontent.com/peasoft/NoMoreWalls/master/list.meta.yml", "type": "github"},
+    {"name": "anaer/Sub", "url": "https://raw.githubusercontent.com/anaer/Sub/main/clash.yaml", "type": "github"},
+    # ===== CF 优选源（host:port 列表，走 CF 优选管线，不喂给 subs-check）=====
     {"name": "BestCF-CMCC", "url": "https://090227.pages.dev/bestcf?isp=cmcc&ips=100", "type": "http"},
     {"name": "BestCF-US", "url": "https://bestcf.pages.dev/random-region/US/all.txt", "type": "http"},
     {"name": "BestCF-JP", "url": "https://bestcf.pages.dev/random-region/JP/all.txt", "type": "http"},

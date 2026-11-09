@@ -232,6 +232,7 @@
         const API = '/api';
         let currentPage = 'dashboard';
         let allNodes = [];
+        let _nodeSelected = new Set();
 
         // 统一 fetch 包装：管理 API 返回 401 时（会话过期）拉起登录遮罩
         const _rawFetch = window.fetch.bind(window);
@@ -481,6 +482,8 @@
                         </label>
                         <button class="btn btn-secondary" onclick="exportNodes('csv')">CSV</button>
                         <button class="btn btn-secondary" onclick="exportNodes('json')">JSON</button>
+                        <button class="btn btn-danger" id="node-batch-del-btn" onclick="batchDeleteNodes()" disabled>🗑 删除选中 (0)</button>
+                        <button class="btn btn-danger" onclick="deleteUnavailableNodes()">⚡ 清理不可用节点</button>
                         <div class="nf-cols-dd" id="nf-cols-dd" style="position:relative;display:inline-block;">
                             <button type="button" class="btn btn-secondary" id="nf-cols-btn" style="display:inline-flex;align-items:center;gap:6px;user-select:none;cursor:pointer;">⚙️ 列显隐 <span style="font-size:11px;opacity:.6;">▾</span></button>
                         </div>
@@ -511,6 +514,10 @@
             try {
                 const nodes = await (await fetch(url)).json();
                 allNodes = nodes;
+                // 已删除/换页后残留的选择项要清掉，否则计数与实际选中行不符
+                const visible = new Set((nodes || []).map(n => n.id));
+                _nodeSelected = new Set(Array.from(_nodeSelected).filter(id => visible.has(id)));
+                updateNodeBatchDelBtn();
                 // 总数用于计算总页数（来自统计接口）
                 try {
                     const st = await (await fetch(`${API}/nodes/stats`)).json();
@@ -697,16 +704,91 @@
                 else showToast('操作失败', 'error');
             } catch(e) { showToast('❌ ' + e.message, 'error'); }
         }
+
+        // ===== 节点删除（多选 / 单删 / 一键清理不可用）=====
+        function updateNodeBatchDelBtn() {
+            const btn = document.getElementById('node-batch-del-btn');
+            if (!btn) return;
+            const n = _nodeSelected.size;
+            btn.disabled = n === 0;
+            btn.textContent = `🗑 删除选中 (${n})`;
+        }
+
+        function toggleNodeSelect(id, checked) {
+            if (checked) _nodeSelected.add(id);
+            else _nodeSelected.delete(id);
+            updateNodeBatchDelBtn();
+        }
+
+        function toggleSelectAllNodes(cb) {
+            // 只对当前可见（当前页/筛选后）的行全选/取消
+            document.querySelectorAll('#nodes-tbody .node-cb').forEach(el => {
+                const id = parseInt(el.dataset.id);
+                el.checked = cb.checked;
+                if (cb.checked) _nodeSelected.add(id);
+                else _nodeSelected.delete(id);
+            });
+            updateNodeBatchDelBtn();
+        }
+
+        async function deleteNode(id) {
+            if (!confirm('确定删除该节点？\n（删除后下轮定时抓取也不会重新导入）')) return;
+            try {
+                const r = await (await fetch(`${API}/nodes/${id}`, { method: 'DELETE' })).json();
+                if (r.detail) { showToast('删除失败: ' + r.detail, 'error'); return; }
+                showToast(`✅ 已删除 ${r.deleted} 个节点`, 'success');
+                _nodeSelected.delete(id);
+                loadNodes();
+            } catch(e) { showToast('删除失败: ' + (e.message || '网络错误'), 'error'); }
+        }
+
+        async function batchDeleteNodes() {
+            const ids = Array.from(_nodeSelected);
+            if (!ids.length) { showToast('请先选择要删除的节点', 'error'); return; }
+            if (!confirm(`确定删除选中的 ${ids.length} 个节点？\n（删除后下轮定时抓取也不会重新导入）`)) return;
+            try {
+                const r = await (await fetch(`${API}/nodes/batch-delete`, {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({ids})
+                })).json();
+                if (r.detail) { showToast('删除失败: ' + r.detail, 'error'); return; }
+                showToast(`✅ 已删除 ${r.deleted} 个节点`, 'success');
+                _nodeSelected.clear();
+                updateNodeBatchDelBtn();
+                loadNodes();
+            } catch(e) { showToast('删除失败: ' + (e.message || '网络错误'), 'error'); }
+        }
+
+        async function deleteUnavailableNodes() {
+            if (!confirm('确定一键清理所有不可用节点（inactive / dead）？\n（删除后下轮定时抓取不会重新导入这些节点）')) return;
+            try {
+                showToast('正在清理不可用节点...');
+                const r = await (await fetch(`${API}/nodes/delete-by-status`, {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({statuses: ['inactive', 'dead', 'unknown']})
+                })).json();
+                if (r.detail) { showToast('删除失败: ' + r.detail, 'error'); return; }
+                showToast(`✅ 已清理 ${r.deleted} 个不可用节点`, 'success');
+                _nodeSelected.clear();
+                updateNodeBatchDelBtn();
+                loadNodes();
+            } catch(e) { showToast('删除失败: ' + (e.message || '网络错误'), 'error'); }
+        }
+
         function renderNodeTable(nodes) {
             const tbody = document.getElementById('nodes-tbody');
             const thead = document.getElementById('nodes-thead-row');
             if (!tbody) return;
             const cols = [
-                ['star','',''], ['name','名称'], ['type','协议'], ['country','国家'],
+                ['sel','',''], ['star','',''], ['name','名称'], ['type','协议'], ['country','国家'],
                 ['latency','延迟'], ['speed','速度'], ['score','评分'], ['grade','等级'], ['status','状态'],
-                ['stream','解锁',''], ['trend','📈',''], ['ban','🚫','']
+                ['stream','解锁',''], ['trend','📈',''], ['ban','🚫',''], ['del','🗑','']
             ].filter(c => !colVis.includes(c[0]));
-            if (thead) thead.innerHTML = cols.map(c => `<th>${c[1]}</th>`).join('');
+            if (thead) thead.innerHTML = cols.map(c => c[0] === 'sel'
+                ? `<th style="width:36px;"><input type="checkbox" id="node-select-all" onchange="toggleSelectAllNodes(this)"></th>`
+                : `<th>${c[1]}</th>`).join('');
             if (!nodes.length) { tbody.innerHTML = `<tr><td colspan="${cols.length}" class="empty"><div class="empty-icon">📭</div>暂无节点</td></tr>`; return; }
             tbody.innerHTML = nodes.map(n => {
                 const speed = n.download_speed ? (n.download_speed >= 1048576 ? (n.download_speed/1048576).toFixed(1)+'MB/s' : Math.round(n.download_speed/1024)+'KB/s') : '-';
@@ -719,6 +801,7 @@
                 const grade = n.grade ? `<span class="badge ${score>=70?'badge-success':score>=50?'badge-warning':'badge-danger'}"${n.status !== 'active' ? ' style="opacity:0.45;"' : ''}>${n.emoji||''} ${n.grade}</span>` : '-';
                 const safeName = String(n.node_name||'').replace(/'/g,'').slice(0,40);
                 const cells = {
+                    sel: `<td><input type="checkbox" class="node-cb" data-id="${n.id}"${_nodeSelected.has(n.id) ? ' checked' : ''} onchange="toggleNodeSelect(${n.id}, this.checked)"></td>`,
                     star: `<td style="cursor:pointer;font-size:16px;" onclick="toggleFavorite(${n.id})" title="收藏（订阅置顶）">${starIcon(n)}</td>`,
                     name: `<td style="max-width:180px;overflow:hidden;text-overflow:ellipsis;">${n.node_name||'-'}</td>`,
                     type: `<td><span class="badge badge-info">${(n.node_type||'').toUpperCase()}</span></td>`,
@@ -732,7 +815,8 @@
                     trend: `<td style="cursor:pointer;" onclick="showTrend(${n.id},'${safeName}')" title="近7天趋势">📈</td>`,
                     ban: `<td style="cursor:pointer;white-space:nowrap;" title="${n.status==='banned'?'解封':'封禁'}">${n.status==='banned'
                         ? `<button class="btn btn-secondary btn-sm" onclick="banNode(${n.id},false)">♻️ 解封</button>`
-                        : `<button class="btn btn-secondary btn-sm" onclick="banNode(${n.id},true)">🚫 封禁</button>`}</td>`
+                        : `<button class="btn btn-secondary btn-sm" onclick="banNode(${n.id},true)">🚫 封禁</button>`}</td>`,
+                    del: `<td style="white-space:nowrap;"><button class="btn btn-danger btn-sm" onclick="deleteNode(${n.id})" title="删除该节点">🗑</button></td>`
                 };
                 return '<tr>' + cols.map(c => cells[c[0]]).join('') + '</tr>';
             }).join('');
@@ -870,8 +954,24 @@
                 </div>
                 <div id="sources-tab-list" style="${sourcesTab==='list'?'':'display:none;'}">
                     <div id="source-health" class="stats-grid" style="grid-template-columns:repeat(3,1fr);"></div>
+                    <div class="flex" style="flex-wrap:wrap;gap:10px;align-items:center;margin:14px 0;">
+                        <select class="form-input" id="src-filter-state" style="width:150px;" onchange="renderSourcesTable()">
+                            <option value="all">全部状态</option>
+                            <option value="healthy">仅健康</option>
+                            <option value="unhealthy">仅异常</option>
+                            <option value="pending">仅待抓取</option>
+                        </select>
+                        <input class="form-input" id="src-filter-keyword" style="flex:1;min-width:200px;"
+                               placeholder="按名称 / URL 搜索…" oninput="renderSourcesTable()">
+                        <label class="flex" style="align-items:center;gap:5px;font-size:13px;cursor:pointer;">
+                            <input type="checkbox" id="src-show-disabled" onchange="renderSourcesTable()"> 显示已禁用
+                        </label>
+                        <button class="btn btn-secondary" onclick="renderSourcesTable()">🔍 筛选</button>
+                        <button class="btn btn-danger" id="src-batch-del-btn" onclick="batchDeleteSources()" disabled>🗑 删除选中 (0)</button>
+                    </div>
                     <div class="table-container"><table><thead><tr>
-                        <th>名称</th><th>URL</th><th>类型</th><th>节点数</th><th>健康状态</th><th>测速</th><th>操作</th>
+                        <th style="width:36px;"><input type="checkbox" id="src-select-all" onchange="toggleSelectAllSources(this)"></th>
+                        <th>名称</th><th>URL</th><th>类型</th><th>节点数</th><th>健康状态</th><th>参与测速</th><th>操作</th>
                     </tr></thead><tbody id="sources-tbody"></tbody></table></div>
                 </div>
                 <div id="sources-tab-import" style="${sourcesTab==='import'?'':'display:none;'}">
@@ -1393,48 +1493,135 @@
             } catch(err) { out.textContent = '❌ 网络错误'; }
         }
 
+        // 源列表缓存 + 筛选/多选状态
+        let _srcAll = [], _srcHealth = [], _srcSelected = new Set();
+
         async function loadSources() {
             try {
                 const [sources, health, stats] = await Promise.all([
-                    fetch(`${API}/sources`).then(r=>r.json()),
+                    fetch(`${API}/sources?enabled=false&include_manual=true`).then(r=>r.json()),
                     fetch(`${API}/sources/health`).then(r=>r.json()),
                     fetch(`${API}/nodes/stats`).then(r=>r.json())
                 ]);
                 const healthEl = document.getElementById('source-health');
                 const tbodyEl = document.getElementById('sources-tbody');
                 if (!healthEl || !tbodyEl) return;  // 页面已切换，放弃本次渲染（修复跨页 null 崩溃）
-                const total = sources.length, healthy = health.filter(h => h.healthy).length;
+                _srcAll = Array.isArray(sources) ? sources : [];
+                _srcHealth = Array.isArray(health) ? health : [];
+
+                const healthy = _srcHealth.filter(h => h.state === 'healthy').length;
+                const unhealthy = _srcHealth.filter(h => h.state === 'unhealthy').length;
                 const nodeCount = (stats && stats.total) || 0;  // 真实节点总数（源未关联节点时 reduce 恒为 0）
                 healthEl.innerHTML = `
-                    <div class="stat-card"><div class="stat-value">${total}</div><div class="stat-label">数据源总数</div></div>
+                    <div class="stat-card"><div class="stat-value">${_srcAll.length}</div><div class="stat-label">数据源总数</div></div>
                     <div class="stat-card"><div class="stat-value" style="color:#16a34a;">${healthy}</div><div class="stat-label">健康源</div></div>
+                    <div class="stat-card"><div class="stat-value" style="color:#dc2626;">${unhealthy}</div><div class="stat-label">异常源</div></div>
                     <div class="stat-card"><div class="stat-value" style="color:#2563eb;">${nodeCount}</div><div class="stat-label">累计节点</div></div>
                 `;
-                const tbody = tbodyEl;
-                if (!sources.length) { tbody.innerHTML = '<tr><td colspan="7" class="empty"><div class="empty-icon">📭</div>暂无数据源，点击"预置源"一键导入</td></tr>'; return; }
-                tbody.innerHTML = sources.map(s => {
-                    const h = health.find(h => h.id === s.id);
-                    const st = h ? (h.state || (h.healthy ? 'healthy' : 'unhealthy'))
-                                 : (s.last_status === 1 && s.enabled ? 'healthy' : (s.last_status === 0 ? 'pending' : 'unhealthy'));
-                    const stest = s.speed_test === undefined || s.speed_test === null ? 1 : s.speed_test;
-                    const badge = st === 'healthy' ? '<span class="badge badge-success">健康</span>'
-                                : st === 'pending' ? '<span class="badge badge-info">待抓取</span>'
-                                : `<span class="badge badge-danger">异常${(s.fail_count||0) >= 3 ? '×'+s.fail_count : ''}</span>`;
-                    return `<tr><td>${s.name}</td>
-                        <td style="max-width:280px;overflow:hidden;text-overflow:ellipsis;font-size:12px;" title="${s.url}">${s.url}</td>
-                        <td><span class="badge badge-info">${s.source_type}</span></td>
-                        <td>${s.node_count||0}</td>
-                        <td>${badge}</td>
-                        <td>
-                            <button class="btn btn-sm ${stest ? 'btn-primary' : 'btn-secondary'}" onclick="toggleSpeedTest(${s.id},${stest?0:1})"
-                                title="是否参与延迟/测速">${stest ? '⚡测速中' : '⏸️跳过'}</button>
-                        </td>
-                        <td>
-                            <button class="btn btn-sm ${s.enabled ? 'btn-secondary' : 'btn-primary'}" onclick="toggleSource(${s.id},${!s.enabled})">${s.enabled ? '禁用' : '启用'}</button>
-                            <button class="btn btn-sm btn-danger" onclick="deleteSource(${s.id})">删除</button>
-                        </td></tr>`;
-                }).join('');
+                renderSourcesTable();
             } catch(e) { console.error(e); showToast('数据源加载失败: ' + (e.message||'网络错误'), 'error'); }
+        }
+
+        // 按当前筛选条件渲染源表格（筛选只影响显示，不影响已选集合）
+        function renderSourcesTable() {
+            const tbody = document.getElementById('sources-tbody');
+            if (!tbody) return;
+
+            const stateFilter = (document.getElementById('src-filter-state') || {}).value || 'all';
+            const keyword = ((document.getElementById('src-filter-keyword') || {}).value || '').trim().toLowerCase();
+            const showDisabled = (document.getElementById('src-show-disabled') || {}).checked;
+
+            const healthMap = new Map(_srcHealth.map(h => [h.id, h]));
+            const rows = _srcAll.map(s => {
+                const h = healthMap.get(s.id);
+                const st = h ? (h.state || (h.healthy ? 'healthy' : 'unhealthy'))
+                             : (s.last_status === 1 && s.enabled ? 'healthy' : (s.last_status === 0 ? 'pending' : 'unhealthy'));
+                return {s, st};
+            }).filter(({s, st}) => {
+                if (!showDisabled && !s.enabled) return false;
+                if (stateFilter !== 'all' && st !== stateFilter) return false;
+                if (keyword) {
+                    const hay = `${s.name || ''} ${s.url || ''}`.toLowerCase();
+                    if (!hay.includes(keyword)) return false;
+                }
+                return true;
+            });
+
+            if (!rows.length) {
+                tbody.innerHTML = `<tr><td colspan="8" class="empty"><div class="empty-icon">🔍</div>没有符合筛选条件的数据源</td></tr>`;
+                updateBatchDeleteBtn();
+                return;
+            }
+
+            tbody.innerHTML = rows.map(({s, st}) => {
+                const stest = s.speed_test === undefined || s.speed_test === null ? 1 : s.speed_test;
+                const badge = st === 'healthy' ? '<span class="badge badge-success">健康</span>'
+                            : st === 'pending' ? '<span class="badge badge-info">待抓取</span>'
+                            : `<span class="badge badge-danger">异常${(s.fail_count||0) >= 3 ? '×'+s.fail_count : ''}</span>`;
+                const checked = _srcSelected.has(s.id) ? ' checked' : '';
+                const disabledTag = s.enabled ? '' : ' <span class="badge badge-secondary">已禁用</span>';
+                return `<tr><td><input type="checkbox" class="src-cb" data-id="${s.id}"${checked} onchange="toggleSourceSelect(${s.id}, this.checked)"></td>
+                    <td>${escHtml(s.name || '')}${disabledTag}</td>
+                    <td style="max-width:280px;overflow:hidden;text-overflow:ellipsis;font-size:12px;" title="${escHtml(s.url||'')}">${escHtml(s.url||'')}</td>
+                    <td><span class="badge badge-info">${escHtml(s.source_type||'')}</span></td>
+                    <td>${s.node_count||0}</td>
+                    <td>${badge}</td>
+                    <td>
+                        <button class="btn btn-sm ${stest ? 'btn-primary' : 'btn-secondary'}" onclick="toggleSpeedTest(${s.id},${stest?0:1})"
+                            title="该源是否参与测速任务（与是否正在测速无关）">${stest ? '⚡ 已加入' : '⏸ 已跳过'}</button>
+                    </td>
+                    <td style="white-space:nowrap;">
+                        <button class="btn btn-sm ${s.enabled ? 'btn-secondary' : 'btn-primary'}" onclick="toggleSource(${s.id},${!s.enabled})">${s.enabled ? '禁用' : '启用'}</button>
+                        <button class="btn btn-sm btn-danger" onclick="deleteSource(${s.id})">删除</button>
+                    </td></tr>`;
+            }).join('');
+            updateBatchDeleteBtn();
+        }
+
+        function updateBatchDeleteBtn() {
+            const btn = document.getElementById('src-batch-del-btn');
+            if (!btn) return;
+            const n = _srcSelected.size;
+            btn.disabled = n === 0;
+            btn.textContent = `🗑 删除选中 (${n})`;
+        }
+
+        function toggleSourceSelect(id, checked) {
+            if (checked) _srcSelected.add(id);
+            else _srcSelected.delete(id);
+            updateBatchDeleteBtn();
+        }
+
+        function toggleSelectAllSources(cb) {
+            // 只对当前可见（筛选后）的行全选/取消
+            document.querySelectorAll('#sources-tbody .src-cb').forEach(el => {
+                const id = parseInt(el.dataset.id);
+                el.checked = cb.checked;
+                if (cb.checked) _srcSelected.add(id);
+                else _srcSelected.delete(id);
+            });
+            updateBatchDeleteBtn();
+        }
+
+        async function batchDeleteSources() {
+            const ids = Array.from(_srcSelected);
+            if (!ids.length) { showToast('请先选择要删除的数据源', 'error'); return; }
+            if (!confirm(`确定删除选中的 ${ids.length} 个数据源？\n（删除后该源不再抓取与测速，历史节点数据保留）`)) return;
+            try {
+                const r = await (await fetch(`${API}/sources/batch-delete`, {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({ids})
+                })).json();
+                if (r.detail) { showToast('删除失败: ' + r.detail, 'error'); return; }
+                showToast(`✅ 已删除 ${r.deleted} 个数据源`);
+                _srcSelected.clear();
+                const all = document.getElementById('src-select-all');
+                if (all) all.checked = false;
+                loadSources();
+            } catch(e) {
+                showToast('删除失败: ' + (e.message||'网络错误'), 'error');
+            }
         }
 
         async function toggleSpeedTest(id, speed_test) {
@@ -1655,7 +1842,11 @@
             // 步骤条
             const steps = (d.phases || []).map((name, i) => {
                 let cls = '', icon = '⬜';
-                if (d.phase_idx == null) { cls = ''; }
+                if (d.phase_idx == null) {
+                    // 后端 DB 兜底路径没有阶段信息：已完成则整条打勾，运行中则全部待定
+                    if (d.status === 'completed') { cls = 'done'; icon = '✅'; }
+                    else if (!running && d.status === 'failed') { cls = 'done'; icon = '❌'; }
+                }
                 else if (i < d.phase_idx || (!running && d.phase_idx >= i && d.status === 'completed')) { cls = 'done'; icon = '✅'; }
                 else if (i === d.phase_idx) { cls = running ? 'active' : 'active'; icon = running ? '🔄' : '⏸'; }
                 return `<div style="flex:1;text-align:center;">

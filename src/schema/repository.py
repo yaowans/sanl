@@ -33,6 +33,19 @@ def _migrate(conn):
     add_column("nodes", "stream_flags", "TEXT")  # 流媒体解锁标记（大纲 附录B/H：Netflix/Disney 等）
     add_column("nodes", "city", "TEXT")  # GeoIP 城市信息（附录：优化 geoip_city 补全）
 
+    # 已删除节点指纹墓碑：用户手动删除的节点必须留痕，否则下轮定时抓取
+    # 按 fingerprint upsert 会把它原样重新入库，删除等于白做。
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS deleted_node_tombstones (
+            fingerprint TEXT PRIMARY KEY,
+            node_type TEXT,
+            server TEXT,
+            port INTEGER,
+            deleted_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now'))
+        )
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_dnt_deleted ON deleted_node_tombstones(deleted_at)")
+
     # 节点健康历史（近 N 天延迟/存活趋势，附录：优化 #4）
     conn.execute("""
         CREATE TABLE IF NOT EXISTS node_health_history (
@@ -189,8 +202,14 @@ def upsert_nodes_bulk(items: List[dict]) -> dict:
     now = int(__import__('time').time())
     with get_connection() as conn:
         before = conn.execute("SELECT COUNT(*) FROM nodes").fetchone()[0]
+        # 用户手动删除过的节点不再入库（下轮抓取否则会复活它）
+        tombstoned = _tombstoned_fingerprints(conn)
+        skipped = 0
         for it in items:
             fp = node_fingerprint(it["node_type"], it["node_data"])
+            if fp in tombstoned:
+                skipped += 1
+                continue
             conn.execute(
                 """INSERT INTO nodes (subscribe_url, source_id, node_name, node_type,
                                       node_data, status, fingerprint, last_seen_at)
@@ -207,7 +226,8 @@ def upsert_nodes_bulk(items: List[dict]) -> dict:
         after = conn.execute("SELECT COUNT(*) FROM nodes").fetchone()[0]
         conn.commit()
     inserted = max(0, after - before)
-    return {"inserted": inserted, "updated": max(0, len(items) - inserted)}
+    return {"inserted": inserted, "updated": max(0, len(items) - inserted - skipped),
+            "skipped": skipped}
 
 
 def mark_missing_inactive(active_fps: set, include_manual: bool = False):
@@ -258,8 +278,12 @@ def apply_check_results(results: List[dict]) -> dict:
     now = int(__import__('time').time())
     alive = len(results)
     with get_connection() as conn:
+        # 用户手动删除过的节点不复活
+        tombstoned = _tombstoned_fingerprints(conn)
         for r in results:
             fp = node_fingerprint(r["node_type"], r["node_data"])
+            if fp in tombstoned:
+                continue
             conn.execute(
                 """INSERT INTO nodes (subscribe_url, source_id, node_name, node_type, node_data,
                                       status, fingerprint, download_speed, latency, country,
@@ -586,6 +610,24 @@ def enable_source(source_id: int, enabled: int = 1):
             "UPDATE sources SET enabled = ?, updated_at = ? WHERE id = ?",
             (enabled, int(__import__('time').time()), source_id)
         )
+
+
+def disable_sources(source_ids: List[int]) -> int:
+    """批量禁用（软删除）数据源，返回受影响行数"""
+    if not source_ids:
+        return 0
+    now = int(__import__('time').time())
+    changed = 0
+    with get_connection() as conn:
+        for i in range(0, len(source_ids), 900):
+            chunk = source_ids[i:i + 900]
+            placeholders = ",".join("?" * len(chunk))
+            cur = conn.execute(
+                f"UPDATE sources SET enabled = 0, updated_at = ? WHERE id IN ({placeholders})",
+                [now] + chunk,
+            )
+            changed += cur.rowcount or 0
+    return changed
 
 
 def set_source_speed_test(source_id: int, speed_test: int = 1):
@@ -1343,6 +1385,109 @@ def set_node_banned(node_id: int, banned: bool) -> bool:
             "UPDATE nodes SET status = ?, updated_at = strftime('%s','now') WHERE id = ?",
             ('banned' if banned else 'unknown', node_id))
         return cur.rowcount > 0
+
+
+# ===== 节点删除（硬删除 + 指纹墓碑）=====
+
+def _tombstoned_fingerprints(conn) -> set:
+    """已删除节点的指纹集合——写入路径据此跳过，避免下轮抓取复活"""
+    rows = conn.execute("SELECT fingerprint FROM deleted_node_tombstones").fetchall()
+    return {r[0] for r in rows if r[0]}
+
+
+def delete_nodes(node_ids: List[int]) -> dict:
+    """删除节点（硬删除 + 指纹墓碑）。
+
+    硬删本身不够：nodes 表按 fingerprint 唯一索引 upsert，下轮定时抓取会把
+    已删节点原样重新导入。因此删除时把 fingerprint 写入墓碑表，
+    写入路径（upsert_nodes_bulk / apply_check_results）据此跳过该指纹。
+
+    SQLite 连接未开 foreign_keys，node_gfw_status 的 ON DELETE CASCADE 不生效，
+    关联子表需手动清理。
+    """
+    if not node_ids:
+        return {"deleted": 0, "tombstoned": 0}
+    ids = list(dict.fromkeys(int(i) for i in node_ids))
+    now = int(__import__('time').time())
+    deleted = 0
+    tombstoned = 0
+    with get_connection() as conn:
+        for i in range(0, len(ids), 900):
+            chunk = ids[i:i + 900]
+            placeholders = ",".join("?" * len(chunk))
+            rows = conn.execute(
+                f"SELECT id, fingerprint, node_type, node_data FROM nodes WHERE id IN ({placeholders})",
+                chunk).fetchall()
+            if not rows:
+                continue
+            row_ids = [r["id"] for r in rows]
+            # 先落墓碑（无指纹节点无法识别来源，但指纹缺失意味着 upsert 不会复活它）
+            for r in rows:
+                fp = r["fingerprint"]
+                if not fp:
+                    continue
+                data = _parse_node_data(r["node_data"])
+                server = str(data.get("server", "")).strip().lower()
+                port = int(data.get("port", 0) or 0)
+                cur = conn.execute(
+                    """INSERT OR IGNORE INTO deleted_node_tombstones
+                       (fingerprint, node_type, server, port, deleted_at) VALUES (?, ?, ?, ?, ?)""",
+                    (fp, r["node_type"], server, port, now))
+                tombstoned += cur.rowcount or 0
+            rp = ",".join("?" * len(row_ids))
+            # 手动清理关联子表（foreign_keys 未开启，CASCADE 不生效）
+            conn.execute(f"DELETE FROM node_gfw_status WHERE node_id IN ({rp})", row_ids)
+            conn.execute(f"DELETE FROM node_health_history WHERE node_id IN ({rp})", row_ids)
+            cur = conn.execute(f"DELETE FROM nodes WHERE id IN ({rp})", row_ids)
+            deleted += cur.rowcount or 0
+    return {"deleted": deleted, "tombstoned": tombstoned}
+
+
+def list_tombstones(limit: int = 200) -> list:
+    """已删除节点墓碑列表（按 fingerprint 可撤销删除）"""
+    with get_connection() as conn:
+        rows = conn.execute(
+            "SELECT fingerprint, node_type, server, port, deleted_at "
+            "FROM deleted_node_tombstones ORDER BY deleted_at DESC LIMIT ?",
+            (limit,)).fetchall()
+        return [dict(r) for r in rows]
+
+
+def restore_tombstones(fingerprints: Optional[List[str]] = None) -> int:
+    """清除指纹墓碑：被删节点可在下轮抓取时重新入库
+
+    fingerprints 为空/None 表示全部清除。
+    """
+    with get_connection() as conn:
+        if not fingerprints:
+            cur = conn.execute("DELETE FROM deleted_node_tombstones")
+        else:
+            n = 0
+            for i in range(0, len(fingerprints), 900):
+                chunk = fingerprints[i:i + 900]
+                placeholders = ",".join("?" * len(chunk))
+                cur = conn.execute(
+                    f"DELETE FROM deleted_node_tombstones WHERE fingerprint IN ({placeholders})",
+                    chunk)
+                n += cur.rowcount or 0
+            return n
+        return cur.rowcount or 0
+
+
+def list_node_ids_by_status(statuses: List[str]) -> List[int]:
+    """按状态取节点 id（用于一键清理不可用节点）"""
+    if not statuses:
+        return []
+    with get_connection() as conn:
+        placeholders = ",".join("?" * len(statuses))
+        rows = conn.execute(
+            f"SELECT id FROM nodes WHERE status IN ({placeholders})", list(statuses)).fetchall()
+        return [r[0] for r in rows]
+
+
+def count_tombstones() -> int:
+    with get_connection() as conn:
+        return conn.execute("SELECT COUNT(*) FROM deleted_node_tombstones").fetchone()[0]
 
 
 def count_nodes_by_source_type(source_type: str) -> int:

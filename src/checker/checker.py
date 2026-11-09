@@ -151,9 +151,14 @@ class Checker:
                     "SELECT * FROM check_jobs ORDER BY created_at DESC LIMIT 1").fetchone()
             if row:
                 r = dict(row)
+                # 兜底路径也要算耗时，否则前端显示 "--"
+                elapsed = None
+                if r.get("started_at"):
+                    end = r.get("finished_at") or time.time()
+                    elapsed = round(end - r["started_at"])
                 return {
                     "job_id": r.get("id"), "source": "scheduled", "status": r.get("status"),
-                    "phase_idx": None, "phases": PHASES, "elapsed": None,
+                    "phase_idx": None, "phases": PHASES, "elapsed": elapsed,
                     "subs_total": None, "nodes_found": None, "nodes_deduped": None,
                     "nodes_alive": None, "traffic": "", "log": [],
                     "finished_at": r.get("finished_at"),
@@ -488,6 +493,22 @@ class Checker:
         except Exception as e:
             logger.warning(f"pkill subs-check failed: {e}")
 
+    def _check_done_marker(self, offset: int = 0) -> bool:
+        """检查 subs-check 是否已在日志里宣告本轮检测完成。
+
+        subs-check 是守护进程（不自己退出），完成时打印 "检测完成"。
+        空结果时它不写 all.yaml，只能靠这个标记收尾。
+        offset 是本轮开始时的日志偏移量——只认本轮之后写入的内容，
+        否则上一轮的"检测完成"会被误当成本轮结束。
+        """
+        try:
+            with open("/tmp/subs-check.log", "r", errors="ignore") as f:
+                f.seek(offset)
+                tail = f.read()
+            return "检测完成" in tail
+        except OSError:
+            return False
+
     async def _run_subs_check(self) -> Dict:
         """运行 subs-check（后台运行，轮询输出文件，因为 subs-check 作为守护进程不会自动退出）"""
         process = None
@@ -508,9 +529,16 @@ class Checker:
 
             # 启动 subs-check（独立进程组，便于整组清理）；stdout/stderr 走管道逐行解析实时进度
             logfile = "/tmp/subs-check.log"
+            # 记录本轮起始偏移：完成标记只认这之后写入的内容，避免上一轮的"检测完成"误判
+            try:
+                log_offset = os.path.getsize(logfile)
+            except OSError:
+                log_offset = 0
             with open(logfile, "a") as f:
                 f.write(f"\n===== Sanl 任务启动 ({self.current_job['source']}) "
                         f"{time.strftime('%Y-%m-%d %H:%M:%S')} =====\n")
+                f.flush()
+                log_offset = f.tell()
             process = await asyncio.create_subprocess_exec(
                 self.binary_path,
                 "-f", self.config_path,
@@ -527,6 +555,7 @@ class Checker:
             poll_interval = 3
             stable_ticks = 0      # 结果文件连续无增长的检测轮数
             last_size = -1
+            done_marker = False   # 子进程日志里是否已出现"检测完成"
 
             while waited < max_wait:
                 await asyncio.sleep(poll_interval)
@@ -534,6 +563,12 @@ class Checker:
 
                 if process.returncode is not None:
                     break
+
+                # subs-check 作为守护进程不会自己退出，但它会在日志里打印"检测完成"。
+                # 空结果时它不写 all.yaml（本轮没有可保存的节点），此时必须靠日志判定结束，
+                # 否则会一直等到 max_wait 超时，前端永远显示"运行中"。
+                if not done_marker:
+                    done_marker = self._check_done_marker(log_offset)
 
                 # 只认本轮启动之后新写入的结果文件（mtime > start_ts）
                 if (os.path.exists(result_file) and os.path.getsize(result_file) > 0
@@ -547,6 +582,20 @@ class Checker:
                         self._terminate(process)
                         await _safe_wait(pump)
                         return await self._read_results()
+
+                # 进程已宣告完成但没产出结果文件 → 本轮空结果，直接收尾
+                if done_marker and not (
+                        os.path.exists(result_file) and os.path.getsize(result_file) > 0
+                        and os.path.getmtime(result_file) > start_ts):
+                    # 再给一点宽限，等文件落盘（正常有结果时日志略早于文件写完）
+                    if waited > poll_interval * 3:
+                        self._terminate(process)
+                        await _safe_wait(pump)
+                        result = await self._read_results()
+                        if not result.get("success"):
+                            result = {"success": False,
+                                      "error": "本轮无可用节点（订阅源全部失效或无存活节点）"}
+                        return result
 
             self._terminate(process)
             await _safe_wait(pump)
