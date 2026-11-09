@@ -1,6 +1,6 @@
 alive-test-url: http://gstatic.com/generate_204
 check-interval: 30
-concurrent: 240
+concurrent: 80
 download-mb: 1
 download-timeout: 6
 filter: []
@@ -32,5 +32,5 @@ sub-urls:
 - http://127.0.0.1:8899/sub/internal/manual
 sub-urls-concurrent: 40
 sub-urls-retry: 3
-timeout: 2000
+timeout: 5000
 total-speed-limit: 0

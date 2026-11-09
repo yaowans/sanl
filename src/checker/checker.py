@@ -44,6 +44,9 @@ CHECK_MODES = {
         "download-timeout": 1,
         "download-mb": 1,
         "min-speed": 0,
+        # ⚠ timeout 5000ms：跨境慢速线路 TCP 握手普遍 2~5s，2s 超时会大批误判死亡
+        #   （实测同批节点 2s 超时判死 42 个、5s 超时复活 13 个，误杀率 24%）
+        "timeout": 5000,
     },
     "speed": {
         "label": "延迟+速度",
@@ -56,6 +59,7 @@ CHECK_MODES = {
         #   手工测速存 21 个 active，全量测速一来 19 个被降级，节点状态反复横跳。
         #   低速节点的过滤交给订阅侧（min_speed 参数）与合格延迟判定，不在测速层删。
         "min-speed": 0,
+        "timeout": 5000,
     },
     "full": {
         "label": "全量(含流媒体)",
@@ -64,6 +68,7 @@ CHECK_MODES = {
         "download-timeout": 6,
         "download-mb": 1,
         "min-speed": 0,
+        "timeout": 5000,
     },
 }
 # 允许通过 API 覆盖的 subs-check 参数白名单
