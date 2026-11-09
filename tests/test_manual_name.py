@@ -112,8 +112,8 @@ with repository.get_connection() as conn:
 assert nm == "我的澳洲节点", nm
 print("  ✓ 自定义名不被覆盖")
 
-# ---------- 6. 域名解析为 IP ----------
-print("\n=== 6. 域名解析（可解析时）===")
+# ---------- 6. 域名原样（不做 DNS 解析）----------
+print("\n=== 6. 域名服务器地址原样呈现 ===")
 h2 = repository.add_node("manual://x", src.id, "US01", "ss",
                          {"server": "one.one.one.one", "port": 443,
                           "password": "p", "cipher": "aes-128-gcm"}, status="active")
@@ -123,10 +123,7 @@ normalize_manual_names(nodes)
 with repository.get_connection() as conn:
     nm = conn.execute("SELECT node_name FROM nodes WHERE id=?", (h2.id,)).fetchone()[0]
 print("  名称:", nm)
-assert nm.startswith("🇺🇸US_1|"), nm
-ip_part = nm.split("|")[1]
-import ipaddress
-ipaddress.ip_address(ip_part)   # 必须是合法 IP（one.one.one.one 是 anycast，1.1.1.1/1.0.0.1 均正常）
-print(f"  ✓ 域名已解析为真实 IP: {ip_part}")
+assert nm == "🇺🇸US_1|one.one.one.one", nm   # 域名原样，不解析
+print("  ✓ 域名原样呈现（CNAME/分线路域名不受境外 DNS 视角影响）")
 
 print("\n=== 全部断言通过 ===")

@@ -41,8 +41,6 @@ ProgressCb = Optional[Callable[[str, int, int, str], None]]
 WORKDIR = "./output/manual"
 # 本地订阅服务端口（避开 subs-check 的 8199 与内核的 7891+）
 LOCAL_SUB_PORT = 8765
-# 域名 → IP 解析缓存（命名用；进程内共享）
-_dns_cache: Dict[str, str] = {}
 
 
 def build_links(nodes) -> List[str]:
@@ -124,38 +122,19 @@ async def fill_geo_for_nodes(nodes) -> int:
 
 
 def normalize_manual_names(nodes, include_ip: bool = True) -> int:
-    """规范化手动节点命名：{国旗}{国家码}_{序号}|{IP}|{速度}
+    """规范化手动节点命名：{国旗}{国家码}_{序号}|{服务器地址}|{速度}
 
     示例：🇯🇵JP_1|49.212.231.67|452KB/s（速度来自最近一次测速，无则省略该段）
-    IP 采用解析后的真实出口（域名先转 IP）；带延迟时格式为
-    {国旗}{国家码}_{序号}|{IP}|{延迟}ms|{速度}。
+    服务器地址段直接用 node_data.server 原值（IP 或域名）——
+    ⚠ 不做 DNS 解析：CNAME/分线路域名（如境内境外分流解析）在境外服务器上
+      可能 NXDOMAIN，强行解析会把用户本可用的域名换成错误/缺失的 IP，
+      还引入每次命名的 DNS 查询延迟。域名原样呈现反而信息更准确。
 
     只处理**没有用户自定义名**的节点（custom_name 优先，不覆盖用户命名）。
     """
-    import re as _re
     from .engine.namer import flag_of
     counter: Dict[str, int] = {}
     updated = 0
-
-    def _resolve(server: str) -> str:
-        """域名 → IP（带缓存；失败返回原值）"""
-        import ipaddress
-        try:
-            ipaddress.ip_address(server)
-            return server
-        except (ValueError, TypeError):
-            pass
-        cached = _dns_cache.get(server)
-        if cached:
-            return cached
-        try:
-            import socket
-            ip = socket.getaddrinfo(server, None, proto=socket.IPPROTO_TCP)[0][4][0]
-            _dns_cache[server] = ip
-            return ip
-        except Exception:
-            _dns_cache[server] = server
-            return server
 
     for n in nodes:
         d = n.node_data if isinstance(n.node_data, dict) else {}
@@ -170,16 +149,17 @@ def normalize_manual_names(nodes, include_ip: bool = True) -> int:
                 code = guess_country(Candidate(proxy={"name": n.node_name or ""}))
             except Exception:
                 code = ""
-        if not code:
-            continue
+        unknown = not code
+        if unknown:
+            code = "Other"   # 国家码未知也继续命名，服务器地址段兜底保证信息量
         key = code
         counter[key] = counter.get(key, 0) + 1
-        flag = flag_of(code) or "🌐"
+        flag = flag_of(code) or ("❓" if unknown else "🌐")
         parts = [f"{flag}{code}_{counter[key]}"]
         if include_ip:
             server = str(d.get("server") or "").strip()
             if server:
-                parts.append(_resolve(server))
+                parts.append(server)   # 原样：IP 就是 IP，域名就是域名
         # 延迟/速度段（测速后回填的值；subs-check 回填解析按 | 分段提取 KB/s、ms）
         if n.latency:
             parts.append(f"{int(n.latency)}ms")
