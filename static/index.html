@@ -759,36 +759,69 @@
             const ids = Array.from(_nodeSelected);
             if (!ids.length) { showToast('请先选择要测速的节点', 'error'); return; }
             if (!confirm(`对选中的 ${ids.length} 个节点做手工测速？\n\n· 只测这些节点，不扫全池\n· 只更新这些节点的状态，其他节点不受影响\n· 同时补齐地区信息并按地区规范化命名（已自定义命名的不动）`)) return;
-            showToast(`⚡ 手工测速已启动（${ids.length} 个节点）…`);
             try {
                 const r = await (await fetch(`${API}/nodes/manual-check`, {
                     method: 'POST', headers: {'Content-Type': 'application/json'},
                     body: JSON.stringify({ids, mode: 'latency', rename: true, refresh_geo: true})
                 })).json();
                 if (r.detail) { showToast('启动失败: ' + r.detail, 'error'); return; }
-                // 轮询任务状态
                 _manualCheckPoll(ids);
             } catch(e) { showToast('启动失败: ' + (e.message||'网络错误'), 'error'); }
         }
 
+        // 手工测速实时进度面板（替代"一秒完成"的无反馈体验）
         function _manualCheckPoll(ids) {
+            // 就地插入进度条（不跳页、不打断选择状态）
+            const old = document.getElementById('mc-progress-panel');
+            if (old) old.remove();
+            const panel = document.createElement('div');
+            panel.id = 'mc-progress-panel';
+            panel.style.cssText = 'position:fixed;right:20px;bottom:20px;z-index:1600;background:var(--card,#fff);border:1px solid var(--border,#e2e8f0);border-radius:12px;padding:14px 18px;box-shadow:0 8px 30px rgba(0,0,0,.18);min-width:280px;font-size:13px;';
+            panel.innerHTML = `
+                <div style="font-weight:700;margin-bottom:8px;">⚡ 手工测速（${ids.length} 个节点）</div>
+                <div style="height:8px;background:var(--surface,#f1f5f9);border-radius:4px;overflow:hidden;margin-bottom:8px;">
+                    <div id="mc-bar" style="height:100%;width:5%;background:var(--primary,#2563eb);border-radius:4px;transition:width .4s;"></div>
+                </div>
+                <div id="mc-detail" style="color:var(--text-muted,#64748b);font-size:12px;">启动中…（50 节点约需 10~30 秒）</div>`;
+            document.body.appendChild(panel);
+
             let tries = 0;
             const timer = setInterval(async () => {
                 tries++;
-                if (tries > 120) { clearInterval(timer); return; }   // 最多等 6 分钟
+                if (tries > 200) { clearInterval(timer); panel.remove(); return; }  // 最多 10 分钟
                 try {
                     const d = await (await fetch(`${API}/tasks`)).json();
                     const t = (d.active || []).find(x => x.name && x.name.includes('手工测速'));
-                    if (!t) {
-                        clearInterval(timer);
-                        showToast('✅ 手工测速完成，正在刷新节点列表…', 'success');
+                    if (t) {
+                        // 实时进度：detail + 百分比
+                        const detail = t.detail || '测速中…';
+                        const pct = (t.total > 0 && t.done <= t.total)
+                            ? Math.round(t.done / t.total * 100)
+                            : (t.pct >= 0 ? t.pct : 12);
+                        const bar = document.getElementById('mc-bar');
+                        const det = document.getElementById('mc-detail');
+                        if (bar) bar.style.width = Math.max(5, Math.min(96, pct)) + '%';
+                        if (det) det.textContent = detail;
+                        return;
+                    }
+                    // 任务结束 → 读 recent 拿结果摘要
+                    clearInterval(timer);
+                    const recent = (d.recent || []).find(x => x.name && x.name.includes('手工测速'));
+                    const summary = recent ? (recent.detail || (recent.error ? '❌ ' + recent.error : '完成')) : '完成';
+                    const bar = document.getElementById('mc-bar');
+                    const det = document.getElementById('mc-detail');
+                    if (bar) { bar.style.width = '100%'; bar.style.background = '#16a34a'; }
+                    if (det) det.textContent = '✅ ' + summary;
+                    showToast('✅ 手工测速完成：' + summary, 'success');
+                    // 停 1.2s 让用户看到结果，再刷新列表并收起面板
+                    setTimeout(() => {
                         _nodeSelected.clear();
                         updateNodeBatchDelBtn();
                         loadNodes();
-                        return;
-                    }
+                        setTimeout(() => panel.remove(), 800);
+                    }, 1200);
                 } catch(e) {}
-            }, 3000);
+            }, 1500);
         }
 
         // ===== 🌍 补齐地区信息 + 规范化命名 =====

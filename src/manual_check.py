@@ -325,15 +325,17 @@ async def run_manual_check(node_ids: List[int], *, mode: str = "latency",
             logger.info(f"[manual] 修复 {fixed} 个节点的 Reality 参数")
             nodes = repository.get_nodes_by_ids(node_ids)
             body = build_clash_yaml(nodes) or body
+            prog("prepare", 10, 100, f"已修复 {fixed} 个节点的 Reality 参数")
     except Exception as e:
         logger.warning(f"[manual] Reality 修复失败: {e}")
 
     # ---- 1. 补 GeoIP 地区信息（测速前补，测速结果也能带上国旗）----
+    prog("geo", 12, 100, "补齐地区信息（GeoIP 查询）…")
     geo_updated = 0
     try:
         geo_updated = await fill_geo_for_nodes(nodes)
         if geo_updated:
-            prog("geo", len(nodes), len(nodes), f"补齐 {geo_updated} 个节点的地区信息")
+            prog("geo", 25, 100, f"已补齐 {geo_updated} 个节点的地区信息")
             nodes = repository.get_nodes_by_ids(node_ids)   # 重新取，带上新 geo
     except Exception as e:
         logger.warning(f"[manual] GeoIP 补全失败: {e}")
@@ -420,7 +422,10 @@ async def run_manual_check(node_ids: List[int], *, mode: str = "latency",
             if "检测完成" in txt:
                 done = True
                 break
-            prog("probe", int(time.time() - t0), timeout_sec, "测速中…")
+            elapsed = int(time.time() - t0)
+            # 进度估算：subs-check 并发高，前 5 秒基本完成测活；按耗时渐近逼近
+            pct = min(90, 30 + int(elapsed * 90 / max(8, timeout_sec)))
+            prog("probe", pct, 100, f"测速中… {elapsed}s（并发探测 {len(nodes)} 个节点）")
     finally:
         _kill_proc(proc)
         try:
@@ -441,6 +446,7 @@ async def run_manual_check(node_ids: List[int], *, mode: str = "latency",
         repository.mark_missing_inactive(set(), scope_fingerprints=scope)
 
     # ---- 5. 规范化命名（地区补齐后才有意义）----
+    prog("rename", 95, 100, "规范化命名…")
     renamed = 0
     try:
         nodes = repository.get_nodes_by_ids(node_ids)
@@ -449,7 +455,8 @@ async def run_manual_check(node_ids: List[int], *, mode: str = "latency",
         logger.warning(f"[manual] 规范化命名失败: {e}")
 
     blocked = len(nodes) - alive
-    prog("done", len(nodes), len(nodes), f"完成：{alive} 存活 / {blocked} 不可用")
+    prog("done", 100, 100,
+         f"完成：{alive} 存活 / {blocked} 不可用 · 补地区 {geo_updated} · 改名 {renamed}")
 
     from .api.cache import invalidate_all
     try:
