@@ -9,7 +9,7 @@ import logging
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, Query, Request, BackgroundTasks, UploadFile, File, Body
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import JSONResponse, HTMLResponse, FileResponse, Response
+from fastapi.responses import JSONResponse, HTMLResponse, FileResponse, Response, RedirectResponse
 from fastapi.routing import APIRouter
 from pydantic import BaseModel, Field
 from typing import List, Optional, Dict
@@ -141,6 +141,7 @@ def create_app() -> FastAPI:
                                      "Service-Worker-Allowed": "/"})
 
     # 客户端订阅指南（独立单页，不能被 SPA fallback 吞掉返回 index.html）
+    # ⚠ 需登录：页面会渲染订阅链接，未登录重定向到主面板（由前端跳登录页）
     @app.get("/client-guide.html", include_in_schema=False)
     async def client_guide():
         return FileResponse(os.path.join(static_dir, "client-guide.html"),
@@ -172,10 +173,12 @@ def create_app() -> FastAPI:
     from ..auth import get_session_user, read_session_cookie
 
     # 无需登录的 API 路径（相对 /api 前缀）
+    # ⚠ 订阅内容输出不在白名单：/api/nodes/subscribe 需要登录会话（管理面板内用）。
+    #   客户端拉订阅走 /sub/{token}/{fmt}（Token 鉴权 + 流量统计），
+    #   否则任何拿到页面的人都能无凭据拉走全部节点（安全修复）。
     _PUBLIC_API = {
         "auth/login", "auth/logout", "auth/me",
-        # 订阅内容输出（客户端拉取）
-        "nodes/subscribe", "nodes", "nodes/stats", "ranking", "map", "map/countries",
+        "nodes", "nodes/stats", "ranking", "map", "map/countries",
         "version", "health", "health/db", "stats/trend", "cache/status",
         # 转换器是纯函数式的公开工具
         "convert", "edgetunnel",
@@ -190,9 +193,15 @@ def create_app() -> FastAPI:
             return await call_next(request)
 
         # 静态资源与 PWA 清单：放行（登录页自身要加载）
+        # ⚠ client-guide.html 不放行：需登录后访问（页面含订阅链接）
         if (path.startswith("/static/") or path.startswith("/vendor/")
-                or path in ("/sw.js", "/manifest.webmanifest", "/favicon.ico",
-                            "/client-guide.html")):
+                or path in ("/sw.js", "/manifest.webmanifest", "/favicon.ico")):
+            return await call_next(request)
+
+        # 客户端订阅指南页：需登录（未登录跳主面板登录）
+        if path == "/client-guide.html":
+            if not get_session_user(read_session_cookie(request)):
+                return RedirectResponse("/", status_code=302)
             return await call_next(request)
 
         # 登录相关接口：放行
@@ -211,8 +220,10 @@ def create_app() -> FastAPI:
             if rel in _PUBLIC_API:
                 return await call_next(request)
             # 令牌接口本身用 Token 机制，不走会话
+            # ⚠ tokens/full 例外：返回完整 token 值，必须登录才能看
             if rel.startswith("tokens") or rel.startswith("token/"):
-                return await call_next(request)
+                if rel != "tokens/full":
+                    return await call_next(request)
 
             user = get_session_user(read_session_cookie(request))
             if not user:
@@ -1575,6 +1586,16 @@ async def list_all_tokens():
         if len(t["token"]) > 8:
             t["token_preview"] = t["token"][:8] + "..." + t["token"][-4:]
     return tokens
+
+
+@api_router.get("/tokens/full")
+async def list_full_tokens(request: Request):
+    """获取完整 Token 列表（管理面板专用——客户端订阅指南页生成 /sub/ 短链用）。
+
+    会话鉴权由全局中间件保证（不在 _PUBLIC_API 白名单），
+    返回完整 token 值，仅限已登录管理员查看。
+    """
+    return repository.list_tokens()
 
 
 @api_router.put("/tokens/{token_id}/toggle")

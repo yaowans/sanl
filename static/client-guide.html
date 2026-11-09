@@ -132,7 +132,7 @@
     .footer { text-align: center; font-size: 12px; color: #aaa; margin-top: 30px; }
   </style>
 </head>
-<body>
+<body style="visibility:hidden;">
   <div class="container">
     <h1>🔗 Sanl 客户端订阅指南</h1>
     <p class="subtitle">为各主流代理客户端提供专用订阅链接，兼容所有平台</p>
@@ -300,25 +300,77 @@
   </div>
 
   <script>
-    // 自动填充订阅链接
-    const BASE = window.location.origin;
-    const urls = {
-      'url-singbox':     `${BASE}/api/nodes/subscribe?fmt=singbox`,
-      'url-clash-meta':  `${BASE}/api/nodes/subscribe?fmt=clash-meta`,
-      'url-clash':       `${BASE}/api/nodes/subscribe?fmt=clash`,
-      'url-neko-singbox':`${BASE}/api/nodes/subscribe?fmt=singbox`,
-      'url-neko-clash':  `${BASE}/api/nodes/subscribe?fmt=clash`,
-      'url-karing-singbox':`${BASE}/api/nodes/subscribe?fmt=singbox`,
-      'url-karing-clash':`${BASE}/api/nodes/subscribe?fmt=clash-meta`,
-      'url-v2rayn':      `${BASE}/api/nodes/subscribe?fmt=clash-meta`,
-      'url-stash':       `${BASE}/api/nodes/subscribe?fmt=clash-meta`,
-      'url-v2ray':       `${BASE}/api/nodes/subscribe?fmt=v2ray`,
-      'url-base64':      `${BASE}/api/nodes/subscribe?fmt=base64`,
-    };
+    // ===== 鉴权守卫：未登录跳主面板登录页 =====
+    (async () => {
+      try {
+        const r = await fetch('/api/auth/me', { credentials: 'same-origin' });
+        const d = await r.json();
+        // /api/auth/me 未登录也返回 200，用 user 字段判断
+        if (!d || !d.user) { location.href = '/'; return; }
+      } catch (e) { location.href = '/'; return; }
+      document.body.style.visibility = 'visible';
+      initPage();
+    })();
 
-    Object.entries(urls).forEach(([id, url]) => {
-      document.getElementById(id).value = url;
-    });
+    async function initPage() {
+      // 拉第一个可用 Token，生成 /sub/{token}/{fmt} 短链
+      let token = null;
+      try {
+        const r = await fetch('/api/tokens/full', { credentials: 'same-origin' });
+        if (r.ok) {
+          const tokens = await r.json();
+          const active = (tokens || []).find(t => t.is_active);
+          if (active) token = active.token;
+        }
+      } catch (e) {}
+      buildLinks(token);
+
+      // 节点统计
+      try {
+        const r = await fetch('/api/nodes/stats');
+        const d = await r.json();
+        document.getElementById('stat-total').textContent = (d.pool_total || d.total || 0).toLocaleString();
+        document.getElementById('stat-active').textContent = (d.active || 0).toLocaleString();
+      } catch (e) {}
+    }
+
+    function buildLinks(token) {
+      const BASE = window.location.origin;
+      // Token 短链：客户端直接用，带鉴权与流量统计
+      const sub = fmt => token ? `${BASE}/sub/${token}/${fmt}` : null;
+      const urls = {
+        'url-singbox':     sub('singbox'),
+        'url-clash-meta':  sub('clash-meta'),
+        'url-clash':       sub('clash'),
+        'url-neko-singbox':sub('singbox'),
+        'url-neko-clash':  sub('clash'),
+        'url-karing-singbox':sub('singbox'),
+        'url-karing-clash':sub('clash-meta'),
+        'url-v2rayn':      sub('clash-meta'),
+        'url-stash':       sub('clash-meta'),
+        'url-v2ray':       sub('v2ray'),
+        'url-base64':      sub('base64'),
+      };
+
+      for (const [id, url] of Object.entries(urls)) {
+        const el = document.getElementById(id);
+        if (!el) continue;
+        if (url) { el.value = url; }
+        else {
+          el.value = '⚠ 未创建订阅 Token——请到「令牌管理」页创建后刷新本页';
+          el.style.color = '#dc2626';
+        }
+      }
+
+      // 无 Token 时横幅提示
+      if (!token) {
+        const banner = document.createElement('div');
+        banner.style.cssText = 'background:#fef2f2;border:1px solid #fecaca;color:#b91c1c;padding:12px 16px;border-radius:10px;margin-bottom:20px;font-size:14px;';
+        banner.innerHTML = '⚠ 还没有订阅 Token。请先到管理面板「🔑 令牌管理」创建一个，再刷新本页生成订阅链接。';
+        const stats = document.querySelector('.stats');
+        if (stats) stats.parentNode.insertBefore(banner, stats.nextSibling);
+      }
+    }
 
     function copyUrl(inputId, btn) {
       const input = document.getElementById(inputId);
@@ -330,15 +382,6 @@
         setTimeout(() => { btn.textContent = orig; btn.classList.remove('copied'); }, 2000);
       });
     }
-
-    // 加载节点统计
-    fetch('/api/nodes/stats')
-      .then(r => r.json())
-      .then(d => {
-        document.getElementById('stat-total').textContent = (d.pool_total || d.total || 0).toLocaleString();
-        document.getElementById('stat-active').textContent = (d.active || 0).toLocaleString();
-      })
-      .catch(() => {});
   </script>
 </body>
 </html>
