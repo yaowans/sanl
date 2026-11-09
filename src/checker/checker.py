@@ -756,8 +756,9 @@ class Checker:
             # speed 模式名称不含延迟，从下载速度反推（subs-check 存活节点均为低速延迟）
             if latency is None and download_speed is not None:
                 latency = max(50, int(2048000 / (download_speed or 256)))
-            elif latency is None:
-                latency = 500
+            # ⚠ latency 仍为 None 时不造假数据（旧代码硬塞 500ms）：
+            #   测活通过但延迟缺失是真实状态（下载失败/超时节点），
+            #   入库 latency=NULL 前端显示 "-"，GFW 复核与订阅过滤不受影响
 
             node_data = dict(proxy)  # clash 原字段即内部存储格式
             node_data.pop('name', None)

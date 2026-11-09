@@ -1953,12 +1953,18 @@ def delete_app_settings(keys: List[str]) -> int:
 
 
 def apply_qualified_latency(threshold_ms: int) -> int:
-    """合格延迟判定：超过阈值或未获取延迟的存活节点标记 inactive（订阅默认输出 active）"""
+    """合格延迟判定：超过阈值的存活节点标记 inactive（订阅默认输出 active）
+
+    ⚠ latency IS NULL 的节点**不降级**：NULL = 本轮未获取到延迟
+      （latency 模式不测速 / 下载失败节点），不是"延迟不合格"。
+      旧代码把 NULL 也降级——手工测速(speed)存的 active 会被
+      全量测速的合格判定连带清洗，状态反复横跳。
+    """
     with get_connection() as conn:
         cur = conn.execute(
             "UPDATE nodes SET status = 'inactive', updated_at = strftime('%s','now') "
             "WHERE status = 'active' "
-            "AND (latency IS NULL OR latency > ?)",
+            "AND latency IS NOT NULL AND latency > ?",
             (threshold_ms,))
         return cur.rowcount
 

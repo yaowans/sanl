@@ -762,7 +762,7 @@
             try {
                 const r = await (await fetch(`${API}/nodes/manual-check`, {
                     method: 'POST', headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({ids, mode: 'latency', rename: true, refresh_geo: true})
+                    body: JSON.stringify({ids, mode: 'speed', rename: true, refresh_geo: true})
                 })).json();
                 if (r.detail) { showToast('启动失败: ' + r.detail, 'error'); return; }
                 _manualCheckPoll(ids);

@@ -272,8 +272,9 @@ def _parse_subs_output(path: str) -> List[dict]:
                     break
         if latency is None and download_speed is not None:
             latency = max(50, int(2048000 / (download_speed or 256)))
-        elif latency is None:
-            latency = 500
+        # ⚠ latency 仍为 None 时**不造假数据**：测活通过但延迟/速度缺失是真实状态
+        #   （如 latency 模式不测速），入库 latency=NULL，前端显示 "-"。
+        #   旧代码硬塞 500ms 假延迟——用户看到清一色 500ms 还以为测速坏了。
         node_data = dict(proxy)
         node_data.pop("name", None)
         results.append({
