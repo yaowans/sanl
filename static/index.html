@@ -475,6 +475,9 @@
                             <option value="manual">🛠 手动导入</option>
                             <option value="auto">🤖 系统优选</option>
                         </select>
+                        <select class="form-input" style="width:140px;" id="nf-country" onchange="loadNodes()">
+                            <option value="">全部国家/地区</option>
+                        </select>
                         <select class="form-input" style="width:100px;" id="nf-order" onchange="loadNodes()">
                             <option value="asc">升序</option>
                             <option value="desc">降序</option>
@@ -497,6 +500,25 @@
             `;
             restoreColVis();
             loadNodes();
+            loadCountryFilter();
+        }
+
+        // 填充「国家/地区」筛选下拉
+        async function loadCountryFilter() {
+            const sel = document.getElementById('nf-country');
+            if (!sel) return;
+            const cur = sel.value;
+            try {
+                const d = await (await fetch(`${API}/nodes/countries`)).json();
+                const items = d.items || [];
+                sel.innerHTML = '<option value="">全部国家/地区</option>' + items.map(c => {
+                    const code = (c.country_code || '').toUpperCase();
+                    const flag = flagEmoji(code);
+                    const name = (c.country || code || '未知').replace(/^[^\w一-龥]+/, '');
+                    return `<option value="${escHtml(code)}">${flag ? flag+' ' : ''}${escHtml(name)} (${c.count})</option>`;
+                }).join('');
+                if (cur) sel.value = cur;
+            } catch(e) {}
         }
 
         let nodePage = 0, nodePageSize = 50, nodeTotal = 0;
@@ -508,12 +530,14 @@
             const sort = document.getElementById('nf-sort') ? document.getElementById('nf-sort').value : 'latency';
             const order = document.getElementById('nf-order') ? document.getElementById('nf-order').value : 'asc';
             const src = document.getElementById('nf-src') ? document.getElementById('nf-src').value : '';
+            const cc = document.getElementById('nf-country') ? document.getElementById('nf-country').value : '';
             const offset = nodePage * nodePageSize;
             // 真分页：每次只拉当前页（原写死 limit=200 导致永远只显示前 4 页）
             let url = `${API}/nodes?limit=${nodePageSize}&offset=${offset}&sort=${sort}&order=${order}&_t=${Date.now()}`;
             if (status) url += `&status=${status}`;
             if (type) url += `&node_type=${type}`;
             if (src) url += `&source_type=${src}`;
+            if (cc) url += `&country_code=${encodeURIComponent(cc)}`;
             try {
                 const nodes = await (await fetch(url)).json();
                 allNodes = nodes;
@@ -578,7 +602,8 @@
             panel.id = 'nf-cols-panel';
             panel.style.cssText = 'position:fixed;z-index:1500;display:none;background:var(--surface);border:1px solid var(--border);border-radius:10px;box-shadow:var(--shadow-lg);padding:10px 14px;flex-direction:column;gap:6px;min-width:130px;';
             panel.innerHTML = [
-                ['country','国家列'],['latency','延迟列'],['speed','速度列'],
+                ['id','编号列'],['name','名称列'],['country','国家/地区列'],['ip','服务器 IP 列'],
+                ['latency','延迟列'],['speed','速度列'],
                 ['score','评分列'],['grade','等级列'],['status','状态列']
             ].map(([v,t]) => `<label style="display:flex;align-items:center;gap:8px;font-size:13px;cursor:pointer;"><input type="checkbox" value="${v}" class="nf-col-cb"> ${t}</label>`).join('');
             document.body.appendChild(panel);
@@ -708,6 +733,25 @@
             } catch(e) { showToast('❌ ' + e.message, 'error'); }
         }
 
+        // ===== 节点重命名 =====
+        async function renameNode(id) {
+            const cur = (allNodes.find(n => n.id === id) || {}).node_name || '';
+            const name = prompt('输入新的节点名称：', cur);
+            if (name === null) return;                    // 取消
+            const trimmed = name.trim();
+            if (!trimmed) { showToast('名称不能为空', 'error'); return; }
+            if (trimmed === cur) return;                 // 没改
+            try {
+                const r = await (await fetch(`${API}/nodes/${id}/rename`, {
+                    method: 'POST', headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({name: trimmed})
+                })).json();
+                if (r.detail) { showToast('重命名失败: ' + r.detail, 'error'); return; }
+                showToast(`✅ 已重命名为「${trimmed}」`, 'success');
+                loadNodes();
+            } catch(e) { showToast('重命名失败: ' + (e.message||'网络错误'), 'error'); }
+        }
+
         // ===== 节点删除（多选 / 单删 / 一键清理不可用）=====
         function updateNodeBatchDelBtn() {
             const btn = document.getElementById('node-batch-del-btn');
@@ -764,7 +808,7 @@
         }
 
         async function deleteUnavailableNodes() {
-            if (!confirm('确定一键清理所有不可用节点（inactive / dead）？\n（删除后下轮定时抓取不会重新导入这些节点）')) return;
+            if (!confirm('确定一键清理所有不可用节点（inactive / dead / unknown）？\n\n（删除后下轮定时抓取不会重新导入这些节点）\n手动导入的节点默认不会被删除。')) return;
             try {
                 showToast('正在清理不可用节点...');
                 const r = await (await fetch(`${API}/nodes/delete-by-status`, {
@@ -773,7 +817,8 @@
                     body: JSON.stringify({statuses: ['inactive', 'dead', 'unknown']})
                 })).json();
                 if (r.detail) { showToast('删除失败: ' + r.detail, 'error'); return; }
-                showToast(`✅ 已清理 ${r.deleted} 个不可用节点`, 'success');
+                const skip = r.skipped_manual ? `（已跳过 ${r.skipped_manual} 个手动导入节点）` : '';
+                showToast(`✅ 已清理 ${r.deleted} 个不可用节点${skip}`, 'success');
                 _nodeSelected.clear();
                 updateNodeBatchDelBtn();
                 loadNodes();
@@ -785,9 +830,10 @@
             const thead = document.getElementById('nodes-thead-row');
             if (!tbody) return;
             const cols = [
-                ['sel','',''], ['star','',''], ['name','名称'], ['type','协议'], ['country','国家'],
-                ['latency','延迟'], ['speed','速度'], ['score','评分'], ['grade','等级'], ['status','状态'],
-                ['stream','解锁',''], ['trend','📈',''], ['ban','🚫',''], ['del','🗑','']
+                ['sel','',''], ['star','',''], ['id','编号'], ['name','名称'], ['type','协议'],
+                ['country','国家/地区'], ['ip','服务器 IP'], ['latency','延迟'], ['speed','速度'],
+                ['score','评分'], ['grade','等级'], ['status','状态'],
+                ['stream','解锁',''], ['trend','📈',''], ['ban','🚫',''], ['rename','✏️',''], ['del','🗑','']
             ].filter(c => !colVis.includes(c[0]));
             if (thead) thead.innerHTML = cols.map(c => c[0] === 'sel'
                 ? `<th style="width:36px;"><input type="checkbox" id="node-select-all" onchange="toggleSelectAllNodes(this)"></th>`
@@ -806,9 +852,12 @@
                 const cells = {
                     sel: `<td><input type="checkbox" class="node-cb" data-id="${n.id}"${_nodeSelected.has(n.id) ? ' checked' : ''} onchange="toggleNodeSelect(${n.id}, this.checked)"></td>`,
                     star: `<td style="cursor:pointer;font-size:16px;" onclick="toggleFavorite(${n.id})" title="收藏（订阅置顶）">${starIcon(n)}</td>`,
-                    name: `<td style="max-width:180px;overflow:hidden;text-overflow:ellipsis;">${n.node_name||'-'}</td>`,
+                    id: `<td style="font-family:ui-monospace,monospace;font-size:12px;color:var(--text-muted);">${n.id}</td>`,
+                    name: `<td style="max-width:180px;overflow:hidden;text-overflow:ellipsis;" title="${escHtml(n.node_name||'')}">${n.manual?'<span class="badge badge-info" style="margin-right:4px;" title="手动导入节点（一键清理时不会被删除）">🛠</span>':''}${escHtml(n.node_name||'-')}</td>`,
                     type: `<td><span class="badge badge-info">${(n.node_type||'').toUpperCase()}</span></td>`,
                     country: `<td>${countryCell(n)}</td>`,
+                    ip: `<td style="font-family:ui-monospace,monospace;font-size:12px;max-width:160px;overflow:hidden;text-overflow:ellipsis;"
+                           title="${escHtml((n.server||'')+(n.port?':'+n.port:''))}">${escHtml(n.server||'-')}${n.port?':'+n.port:''}</td>`,
                     latency: `<td${stale}>${n.latency ? n.latency+'ms' : '-'}</td>`,
                     speed: `<td${stale}>${speed}</td>`,
                     score: `<td${staleColor}>${score.toFixed(1)}</td>`,
@@ -819,6 +868,7 @@
                     ban: `<td style="cursor:pointer;white-space:nowrap;" title="${n.status==='banned'?'解封':'封禁'}">${n.status==='banned'
                         ? `<button class="btn btn-secondary btn-sm" onclick="banNode(${n.id},false)">♻️ 解封</button>`
                         : `<button class="btn btn-secondary btn-sm" onclick="banNode(${n.id},true)">🚫 封禁</button>`}</td>`,
+                    rename: `<td style="white-space:nowrap;"><button class="btn btn-secondary btn-sm" onclick="renameNode(${n.id})" title="重命名节点">✏️</button></td>`,
                     del: `<td style="white-space:nowrap;"><button class="btn btn-danger btn-sm" onclick="deleteNode(${n.id})" title="删除该节点">🗑</button></td>`
                 };
                 return '<tr>' + cols.map(c => cells[c[0]]).join('') + '</tr>';
@@ -1609,7 +1659,7 @@
         async function batchDeleteSources() {
             const ids = Array.from(_srcSelected);
             if (!ids.length) { showToast('请先选择要删除的数据源', 'error'); return; }
-            if (!confirm(`确定删除选中的 ${ids.length} 个数据源？\n（删除后该源不再抓取与测速，历史节点数据保留）`)) return;
+            if (!confirm(`确定删除选中的 ${ids.length} 个数据源？\n\n源会被真正删除，且不会被预置源导入 / 24 小时自动重启用 / 抓取成功复活。\n这些源下的节点也会一并删除。`)) return;
             try {
                 const r = await (await fetch(`${API}/sources/batch-delete`, {
                     method: 'POST',
@@ -1617,7 +1667,7 @@
                     body: JSON.stringify({ids})
                 })).json();
                 if (r.detail) { showToast('删除失败: ' + r.detail, 'error'); return; }
-                showToast(`✅ 已删除 ${r.deleted} 个数据源`);
+                showToast(`✅ 已删除 ${r.deleted} 个数据源（连带 ${r.nodes_deleted || 0} 个节点）`);
                 _srcSelected.clear();
                 const all = document.getElementById('src-select-all');
                 if (all) all.checked = false;
@@ -1638,10 +1688,13 @@
             loadSources();
         }
         async function deleteSource(id) {
-            if (!confirm('确定删除此数据源？')) return;
-            await fetch(`${API}/sources/${id}`, {method:'DELETE'});
-            showToast('已删除');
-            loadSources();
+            if (!confirm('确定删除此数据源？\n\n源会被真正删除，且不会被预置源导入 / 24 小时自动重启用 / 抓取成功复活。\n该源下的节点也会一并删除（节点同样留墓碑，下轮抓取不会恢复）。')) return;
+            try {
+                const r = await (await fetch(`${API}/sources/${id}`, {method:'DELETE'})).json();
+                if (r.detail) { showToast('删除失败: ' + r.detail, 'error'); return; }
+                showToast(`✅ 已删除数据源（连带 ${r.nodes_deleted || 0} 个节点）`);
+                loadSources();
+            } catch(e) { showToast('删除失败: ' + (e.message||'网络错误'), 'error'); }
         }
 
         // 手动添加数据源
@@ -1678,13 +1731,17 @@
             try {
                 const presets = await (await fetch(`${API}/sources/presets`)).json();
                 const grid = document.getElementById('preset-grid');
-                grid.innerHTML = presets.map((p,i) => `
-                    <div class="preset-card ${p.already_added ? 'disabled' : ''}" data-idx="${i}" onclick="togglePreset(${i},${p.already_added})">
-                        <div class="preset-name">${p.already_added ? '✅ ' : ''}${p.name}</div>
-                        <div class="preset-url">${p.url}</div>
-                        <div style="font-size:11px;color:#64748b;margin-top:4px;">${p.already_added ? '已存在' : '点击选中'}</div>
-                    </div>
-                `).join('');
+                grid.innerHTML = presets.map((p,i) => {
+                    const locked = p.already_added || p.deleted;
+                    const mark = p.deleted ? '🗑 ' : p.already_added ? '✅ ' : '';
+                    const note = p.deleted ? '已删除（可恢复后再导入）' : p.already_added ? '已存在' : '点击选中';
+                    return `
+                    <div class="preset-card ${locked ? 'disabled' : ''}" data-idx="${i}" onclick="togglePreset(${i},${locked})">
+                        <div class="preset-name">${mark}${escHtml(p.name)}</div>
+                        <div class="preset-url">${escHtml(p.url)}</div>
+                        <div style="font-size:11px;color:#64748b;margin-top:4px;">${note}</div>
+                    </div>`;
+                }).join('');
             } catch(e) { console.error(e); }
         }
         function togglePreset(idx, already) {
@@ -1738,6 +1795,21 @@
         ];
         let ckMode = 'speed';
 
+        // 测速范围：all=全部 / manual=仅手动导入节点 / auto=仅自动抓取源
+        const CHECK_SCOPES = [
+            { id:'all',    icon:'🌐', name:'全部节点', desc:'自动抓取源 + 手动导入节点一起测' },
+            { id:'manual', icon:'🛠️', name:'仅手动导入', desc:'只测你手动导入的节点（如自己的机场订阅），不碰公共池' },
+            { id:'auto',   icon:'🤖', name:'仅自动抓取', desc:'只测公共免费源抓来的节点，跳过手动导入' },
+        ];
+        let ckScope = 'all';
+
+        function pickScope(scope) {
+            ckScope = scope;
+            document.querySelectorAll('#ck-scopes .ck-mode-card').forEach(el => {
+                el.style.borderColor = el.dataset.scope === scope ? 'var(--primary)' : 'var(--border)';
+            });
+        }
+
         function renderCheck(main) {
             main.innerHTML = `
                 <div class="page-header"><h1 class="page-title">⚡ 测速任务</h1>
@@ -1771,6 +1843,18 @@
                     </details>
                 </div>
                 <div class="chart-container" style="margin-bottom:16px;">
+                    <h3 style="margin-bottom:12px;">🎯 测速范围</h3>
+                    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:10px;" id="ck-scopes">
+                        ${CHECK_SCOPES.map(s => `
+                            <div class="ck-mode-card" data-scope="${s.id}" onclick="pickScope('${s.id}')"
+                                style="cursor:pointer;border:2px solid var(--border);border-radius:12px;padding:12px 14px;transition:all .15s;">
+                                <div style="font-weight:700;font-size:14px;">${s.icon} ${s.name}</div>
+                                <div class="text-muted" style="font-size:11.5px;margin-top:4px;line-height:1.5;">${s.desc}</div>
+                            </div>`).join('')}
+                    </div>
+                    <div class="text-muted" style="font-size:12px;margin-top:8px;" id="ck-scope-hint">加载中…</div>
+                </div>
+                <div class="chart-container" style="margin-bottom:16px;">
                     <h3 style="margin-bottom:12px;">🎯 合格判定</h3>
                     <div class="flex" style="align-items:center;gap:10px;flex-wrap:wrap;">
                         <label class="text-muted" style="font-size:13px;">合格延迟上限（ms，超过视为不合格，订阅默认不输出）</label>
@@ -1789,6 +1873,22 @@
             loadCheckHistory();
             pollCheckProgress();   // 启动进度轮询
             pickMode(ckMode);      // 恢复上次选择的测速模式
+            pickScope(ckScope);    // 恢复上次选择的测速范围
+            loadScopeHint();
+        }
+
+        async function loadScopeHint() {
+            // 显示手动导入节点数量，让用户知道「仅手动导入」测的是什么
+            const hint = document.getElementById('ck-scope-hint');
+            if (!hint) return;
+            try {
+                // limit=1 只拿一条，总数要用 /nodes/stats 或全量列表
+                const nodes = await (await fetch(`${API}/nodes?limit=1000&source_type=manual`)).json();
+                const total = Array.isArray(nodes) ? nodes.length : 0;
+                hint.textContent = total
+                    ? `当前手动导入节点 ${total} 个。选「仅手动导入」可单独验证自己的节点是否可用（不消耗公共池测速资源）。`
+                    : '当前没有手动导入的节点。可到「来源管理 → 手动导入」添加。';
+            } catch(e) { hint.textContent = ''; }
         }
 
         async function loadThreshold() {
@@ -1934,6 +2034,9 @@
                 const el = document.getElementById(elId);
                 if (el && el.value !== '' && el.value != null) ov[key] = isNaN(Number(el.value)) ? el.value : Number(el.value);
             }
+            // 测速范围
+            ov.scope = ckScope;
+            const scopeName = CHECK_SCOPES.find(s=>s.id===ckScope)?.name || '全部节点';
             try {
                 const qs = new URLSearchParams({ trigger, mode: ckMode });
                 const body = Object.keys(ov).length ? JSON.stringify(ov) : undefined;
@@ -1944,7 +2047,7 @@
                 if (r.status === 'already_running') {
                     showToast(`已有${r.source==='manual'?'前台':'后台'}测速正在运行（任务 #${r.job_id}）`, 'error');
                 } else {
-                    showToast(`${label}测速已启动（${CHECK_MODES.find(m=>m.id===ckMode)?.name || ckMode}），正在跟踪实时进度…`);
+                    showToast(`${label}测速已启动（${CHECK_MODES.find(m=>m.id===ckMode)?.name || ckMode} · ${scopeName}），正在跟踪实时进度…`);
                     setTimeout(() => { if (currentPage === 'check') pollCheckProgress(); }, 1200);
                 }
             } catch(e) { showToast('启动失败: '+e.message, 'error'); }

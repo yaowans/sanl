@@ -221,14 +221,31 @@ class Checker:
             max_sources = int((overrides or {}).get("max_sources", 0) or 0)
             if max_sources and max_sources > 0:
                 sources = sorted(sources, key=lambda s: int(getattr(s, 'node_count', 0) or 0), reverse=True)[:max_sources]
-            if not sources:
+            # 测速范围：all=全部 / manual=仅手动导入节点 / auto=仅自动抓取源
+            scope = str((overrides or {}).get("scope", "all") or "all").lower()
+            if scope not in ("all", "manual", "auto"):
+                scope = "all"
+            manual_count = 0
+            try:
+                manual_count = repository.count_nodes_by_source_type("manual")
+            except Exception:
+                manual_count = 0
+            if scope == "manual":
+                sources = []          # 只测手动导入节点（经内部聚合端点喂入）
+            if scope == "auto":
+                manual_count = 0      # 不喂手动节点
+            if not sources and not (scope in ("all", "manual") and manual_count):
                 logger.warning("No enabled sources (or none opted-in to speed test)")
                 repository.update_check_job(job_id.id, "failed", error="No enabled sources")
                 job.update({"status": "failed", "finished_at": time.time(), "error": "No enabled sources"})
                 return {"status": "no_sources", "job_id": job_id}
 
+            scope_label = {"all": "全部", "manual": "仅手动导入", "auto": "仅自动抓取"}[scope]
+            # 解析后的手动节点数传给两个后端（避免各算一遍，也保证 scope=auto 时不喂手动节点）
+            self._manual_node_count = manual_count
             task_manager.update(TASK_ID, phase="running",
-                                detail=f"准备 {len(sources)} 个源订阅（{CHECK_MODES[mode]['label']}）"
+                                detail=f"准备 {len(sources)} 个源订阅 + {manual_count} 个手动节点"
+                                       f"（{scope_label} · {CHECK_MODES[mode]['label']}）"
                                        + (f"，限前 {max_sources} 个源" if max_sources else ""))
 
             import time as _t
@@ -376,14 +393,18 @@ class Checker:
             and (getattr(s, 'source_type', '') or '').lower() not in ('cf-list', 'static')
         ]
         try:
-            manual_count = repository.count_nodes_by_source_type('manual')
+            manual_count = getattr(self, "_manual_node_count", None)
+            if manual_count is None:
+                manual_count = repository.count_nodes_by_source_type('manual')
+            manual_count = int(manual_count or 0)
         except Exception:
             manual_count = 0
         if manual_count > 0:
             local_port = get_app_config().get('port', 8899)
             urls.append(f"http://127.0.0.1:{local_port}/sub/internal/manual")
 
-        ov = {k: v for k, v in (overrides or {}).items() if k != "max_sources"}
+        ov = {k: v for k, v in (overrides or {}).items()
+              if k not in ("max_sources", "scope")}
         # 注意：不继承 subs-check 的 concurrent——两者并发语义完全不同
         # （subs-check 是其内部 goroutine 数；sanl-engine 的 concurrent 是 mihomo 探测通道数，
         #   实测标定 16×8s 最优，灌入 30+ 会因内核过载误杀 ~30% 存活节点）
@@ -462,7 +483,10 @@ class Checker:
             and (getattr(src, 'source_type', '') or '').lower() not in ('cf-list', 'static')
         ]
         try:
-            manual_count = repository.count_nodes_by_source_type('manual')
+            manual_count = getattr(self, "_manual_node_count", None)
+            if manual_count is None:
+                manual_count = repository.count_nodes_by_source_type('manual')
+            manual_count = int(manual_count or 0)
         except Exception:
             manual_count = 0
         if manual_count > 0:
@@ -476,7 +500,7 @@ class Checker:
             if k != "label":
                 config[k] = v
         for k, v in (overrides or {}).items():
-            if k == "max_sources":   # 顶层逻辑参数，不写入 subs-check yaml
+            if k in ("max_sources", "scope"):   # 顶层逻辑参数，不写入 subs-check yaml
                 continue
             if k in OVERRIDABLE_KEYS:
                 config[k] = v

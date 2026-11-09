@@ -196,5 +196,13 @@ async def refresh_node_geo(limit: int = 300) -> dict:
             repository.update_node_geo(n.id, flag, code, city)
             updated += 1
 
+    # 国家信息变了 → 清读缓存（否则「国家/地区」筛选下拉在 TTL 内是旧值）
+    if updated:
+        try:
+            from .api.cache import invalidate_all
+            invalidate_all()
+        except Exception:
+            pass
+
     logger.info(f"GeoIP refreshed: {updated}/{len(nodes)} nodes updated ({len(servers)} servers looked up)")
     return {"updated": updated, "looked_up": len(servers), "total": len(nodes)}

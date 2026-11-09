@@ -299,9 +299,18 @@ async def toggle_source_speed_test(source_id: int, speed_test: bool = True):
 
 @api_router.delete("/sources/{source_id}")
 async def delete_source(source_id: int):
-    """删除数据源"""
-    repository.enable_source(source_id, 0)  # 软删除
-    return {"status": "ok"}
+    """删除数据源（硬删 + URL 墓碑，防复活）
+
+    旧实现只把 enabled 置 0（软删），源仍在列表里，且会被以下路径复活：
+      ① 「导入预置源」重新入库 ② 24h 后自动重启用 ③ 抓取成功强制 enabled=1
+    现改为真删除 + 墓碑，刷新后不再出现。
+    """
+    res = repository.delete_sources([source_id])
+    if not res["deleted"]:
+        raise HTTPException(status_code=404, detail="数据源不存在")
+    invalidate_all()
+    return {"status": "ok", "deleted": res["deleted"],
+            "tombstoned": res["tombstoned"], "nodes_deleted": res["nodes_deleted"]}
 
 
 class BatchSourceIds(BaseModel):
@@ -310,7 +319,7 @@ class BatchSourceIds(BaseModel):
 
 @api_router.post("/sources/batch-delete")
 async def batch_delete_sources(payload: BatchSourceIds):
-    """批量删除数据源（软删除：置为禁用，不破坏历史节点数据）
+    """批量删除数据源（硬删 + URL 墓碑，防复活）
 
     与单条删除一致，只是不再逐个往返。
     """
@@ -319,8 +328,30 @@ async def batch_delete_sources(payload: BatchSourceIds):
     if len(payload.ids) > 500:
         raise HTTPException(status_code=400, detail="单次最多删除 500 个源")
     ids = list(dict.fromkeys(int(i) for i in payload.ids))  # 去重保序
-    repository.disable_sources(ids)
-    return {"status": "ok", "deleted": len(ids)}
+    res = repository.delete_sources(ids)
+    invalidate_all()
+    return {"status": "ok", "deleted": res["deleted"],
+            "tombstoned": res["tombstoned"], "nodes_deleted": res["nodes_deleted"]}
+
+
+@api_router.get("/sources/tombstones")
+async def list_source_tombstones(limit: int = Query(200, ge=1, le=2000)):
+    """已删除数据源记录（墓碑），可据此恢复误删的源"""
+    return {"status": "ok", "total": repository.count_source_tombstones(),
+            "items": repository.list_source_tombstones(limit)}
+
+
+class SourceTombstoneUrls(BaseModel):
+    urls: List[str] = Field(default_factory=list,
+                            description="要恢复的源 URL；为空表示全部恢复")
+
+
+@api_router.post("/sources/tombstones/restore")
+async def restore_source_tombstones(payload: SourceTombstoneUrls):
+    """撤销删除：清除 URL 墓碑，源可重新导入/恢复"""
+    n = repository.restore_source_tombstones([u for u in payload.urls if u])
+    invalidate_all()
+    return {"status": "ok", "restored": n}
 
 
 # ===== 手动导入（订阅链接/节点链接/单节点表单）=====
@@ -459,6 +490,31 @@ class BatchNodeIds(BaseModel):
 class DeleteByStatus(BaseModel):
     statuses: List[str] = Field(default_factory=lambda: ["inactive", "dead"],
                                 description="要删除的节点状态列表")
+    include_manual: bool = Field(False,
+                                  description="是否一并删除手动导入的节点（默认否——用户自己的资产）")
+
+
+class RenameNodeRequest(BaseModel):
+    name: str = Field(..., description="新的节点名称")
+
+
+@api_router.post("/nodes/{node_id}/rename")
+async def rename_node(node_id: int, req: RenameNodeRequest):
+    """节点重命名。
+
+    自定义名写入 node_data.custom_name，后续抓取/测速回填时优先保留，
+    不会被上游名称覆盖。
+    """
+    name = (req.name or "").strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="名称不能为空")
+    if len(name) > 200:
+        raise HTTPException(status_code=400, detail="名称过长（最多 200 字符）")
+    ok = repository.rename_node(node_id, name)
+    if not ok:
+        raise HTTPException(status_code=404, detail="节点不存在")
+    invalidate_all()
+    return {"status": "ok", "id": node_id, "node_name": name}
 
 
 @api_router.delete("/nodes/{node_id}")
@@ -485,15 +541,23 @@ async def batch_delete_nodes(payload: BatchNodeIds):
 
 @api_router.post("/nodes/delete-by-status")
 async def delete_nodes_by_status(payload: DeleteByStatus):
-    """一键删除指定状态的节点（默认清理 inactive + dead 等不可用节点）"""
+    """一键删除指定状态的节点（默认清理 inactive + dead 等不可用节点）
+
+    ⚠ 默认**不删手动导入的节点**（用户自己的资产，误删代价高）。
+    include_manual=true 时才一并删除。
+    """
     if not payload.statuses:
         raise HTTPException(status_code=400, detail="statuses 不能为空")
-    ids = repository.list_node_ids_by_status(payload.statuses)
+    ids = repository.list_node_ids_by_status(payload.statuses,
+                                            include_manual=payload.include_manual)
     if not ids:
-        return {"status": "ok", "deleted": 0, "tombstoned": 0}
+        return {"status": "ok", "deleted": 0, "tombstoned": 0,
+                "skipped_manual": repository.count_nodes_by_source_type("manual")}
     res = repository.delete_nodes(ids)
     invalidate_all()
-    return {"status": "ok", "deleted": res["deleted"], "tombstoned": res["tombstoned"]}
+    return {"status": "ok", "deleted": res["deleted"], "tombstoned": res["tombstoned"],
+            "skipped_manual": 0 if payload.include_manual
+            else repository.count_nodes_by_source_type("manual")}
 
 
 @api_router.get("/nodes/tombstones")
@@ -790,7 +854,8 @@ async def cf_to_nodes(
 @cached(ttl=3)
 async def list_nodes(
     status: Optional[str] = Query(None),
-    country: Optional[str] = Query(None),
+    country: Optional[str] = Query(None, description="国家名（含国旗 emoji）或国家码，如 JP"),
+    country_code: Optional[str] = Query(None, description="两位国家码，如 JP"),
     node_type: Optional[str] = Query(None),
     limit: int = Query(100, le=1000),
     offset: int = Query(0, ge=0),
@@ -803,23 +868,48 @@ async def list_nodes(
 ):
     """获取节点列表（筛选/排序/分页，方案 v2.1 Phase 4）"""
     nodes = repository.list_nodes(
-        status=status, country=country, node_type=node_type, limit=limit,
+        status=status, country=country, country_code=country_code,
+        node_type=node_type, limit=limit,
         offset=offset, min_score=min_score, min_speed=min_speed,
         max_latency=max_latency, sort=sort, order=order, source_type=source_type
     )
+    # 手动导入的节点 id 集合（一键清理时默认跳过）
+    try:
+        manual_ids = set(repository.list_manual_node_ids())
+    except Exception:
+        manual_ids = set()
     result = []
     for n in nodes:
         d = {
             "id": n.id, "node_name": n.node_name, "node_type": n.node_type,
             "status": n.status, "country": n.country, "country_code": getattr(n, "country_code", None),
             "city": getattr(n, "city", None),  # GeoIP 城市信息
+            "server": _node_server(n),  # 服务器地址 / IP
+            "port": _node_port(n),
             "latency": n.latency, "download_speed": n.download_speed, "score": n.score,
             "last_checked_at": n.last_checked_at, "fail_count": getattr(n, "fail_count", 0),
             "stream_flags": getattr(n, "stream_flags", None),  # 流媒体解锁标记（Netflix/Disney/YouTube 等）
+            "favorite": getattr(n, "favorite", 0),
+            "manual": n.id in manual_ids,  # 手动导入节点（一键清理时默认跳过）
         }
         d.update(repository.score_grade(n.score or 0))
         result.append(d)
     return result
+
+
+def _node_server(node) -> str:
+    """从 node_data 提取服务器地址（IP 或域名）"""
+    data = node.node_data if isinstance(node.node_data, dict) else repository._parse_node_data(node.node_data)
+    return str(data.get("server") or "")
+
+
+def _node_port(node) -> Optional[int]:
+    """从 node_data 提取端口"""
+    data = node.node_data if isinstance(node.node_data, dict) else repository._parse_node_data(node.node_data)
+    try:
+        return int(data.get("port") or 0) or None
+    except (TypeError, ValueError):
+        return None
 
 
 @api_router.get("/health", include_in_schema=False)
@@ -844,6 +934,13 @@ async def health_db():
         return {"status": "ok", "db": "sqlite", "total_nodes": total}
     except Exception as e:
         return {"status": "error", "db": "sqlite", "error": str(e)}
+
+
+@api_router.get("/nodes/countries")
+@cached(ttl=10)
+async def list_node_countries():
+    """库内出现过的国家/地区列表（节点列表筛选下拉用）"""
+    return {"status": "ok", "items": repository.list_countries()}
 
 
 @api_router.get("/nodes/stats")
@@ -1229,7 +1326,13 @@ async def run_check(
     overrides: Optional[Dict] = Body(None, description="可选参数覆盖: concurrent/timeout/min-speed/download-mb/download-timeout/speed-concurrent 等"),
 ):
     """触发一次测速：manual=前台(页面实时进度) / scheduled=后台(定时调度同款)
-    mode 可选测试维度；overrides 仅接受白名单键"""
+    mode 可选测试维度；overrides 仅接受白名单键
+
+    overrides.scope 控制测速范围：
+      all     = 全部（默认）
+      manual  = 仅手动导入的节点
+      auto    = 仅自动抓取的源
+    """
     if trigger not in ("manual", "scheduled"):
         raise HTTPException(status_code=400, detail="trigger must be manual|scheduled")
     if mode not in ("latency", "speed", "full"):
@@ -1512,6 +1615,13 @@ async def list_preset_sources():
     # 标记已存在的源
     existing = repository.list_sources(enabled_only=False)
     existing_urls = {s.url for s in existing}
+    # 已删除的源（墓碑）——标记为「已删除」，导入时会被拦截
+    try:
+        with repository.get_connection() as conn:
+            tombstoned = {r[0] for r in conn.execute(
+                "SELECT url FROM deleted_source_tombstones").fetchall()}
+    except Exception:
+        tombstoned = set()
     result = []
     for i, src in enumerate(PRESET_SOURCES):
         result.append({
@@ -1519,7 +1629,8 @@ async def list_preset_sources():
             "name": src["name"],
             "url": src["url"],
             "type": src["type"],
-            "already_added": src["url"] in existing_urls
+            "already_added": src["url"] in existing_urls,
+            "deleted": src["url"] in tombstoned,
         })
     return result
 
@@ -1540,7 +1651,8 @@ async def batch_import_sources(import_data: BatchImportSources):
             if s:
                 imported.append({"name": src["name"], "id": s.id})
             else:
-                skipped.append({"name": src["name"], "reason": "Already exists"})
+                # add_source 返回 None：URL 已存在，或该源被用户删除过（墓碑拦截）
+                skipped.append({"name": src["name"], "reason": "已存在或已删除"})
         except Exception as e:
             errors.append({"name": src["name"], "error": str(e)})
     return {"imported": imported, "skipped": skipped, "errors": errors}

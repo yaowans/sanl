@@ -46,6 +46,22 @@ def _migrate(conn):
     """)
     conn.execute("CREATE INDEX IF NOT EXISTS idx_dnt_deleted ON deleted_node_tombstones(deleted_at)")
 
+    # 已删除数据源墓碑：用户手动删除的源必须留痕。
+    # 否则 ① 预置源会在下次「导入预置源」时重新入库（URL 唯一约束冲突→复活）
+    #    ② fail_count>=5 的源会被 reenable_expired_sources() 24 小时后自动复活
+    #    ③ record_source_success() 抓取成功后会把 enabled 强制置 1
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS deleted_source_tombstones (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            url TEXT NOT NULL,
+            name TEXT,
+            source_type TEXT,
+            deleted_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now'))
+        )
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_dst_url ON deleted_source_tombstones(url)")
+    conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_dst_url_uq ON deleted_source_tombstones(url)")
+
     # 节点健康历史（近 N 天延迟/存活趋势，附录：优化 #4）
     conn.execute("""
         CREATE TABLE IF NOT EXISTS node_health_history (
@@ -214,12 +230,22 @@ def upsert_nodes_bulk(items: List[dict]) -> dict:
         before = conn.execute("SELECT COUNT(*) FROM nodes").fetchone()[0]
         # 用户手动删除过的节点不再入库（下轮抓取否则会复活它）
         tombstoned = _tombstoned_fingerprints(conn)
+        # 用户自定义名（重命名）优先于上游名称——防止抓取回填时被覆盖
+        custom_names = _custom_names(conn)
         skipped = 0
         for it in items:
             fp = node_fingerprint(it["node_type"], it["node_data"])
             if fp in tombstoned:
                 skipped += 1
                 continue
+            upstream_name = it["node_name"]
+            keep = custom_names.get(fp)
+            node_name = keep if keep else upstream_name
+            # ⚠ node_data 会被上游配置整体覆盖，custom_name 必须一起带过去，
+            # 否则本轮就把用户的自定义名抹掉了
+            data = dict(it["node_data"])
+            if keep:
+                data["custom_name"] = keep
             conn.execute(
                 """INSERT INTO nodes (subscribe_url, source_id, node_name, node_type,
                                       node_data, status, fingerprint, last_seen_at)
@@ -230,8 +256,8 @@ def upsert_nodes_bulk(items: List[dict]) -> dict:
                        node_name   = CASE WHEN excluded.node_name != '' THEN excluded.node_name ELSE nodes.node_name END,
                        node_data   = excluded.node_data,
                        last_seen_at = excluded.last_seen_at""",
-                (it["subscribe_url"], it["source_id"], it["node_name"],
-                 it["node_type"], json.dumps(it["node_data"]), fp, now)
+                (it["subscribe_url"], it["source_id"], node_name,
+                 it["node_type"], json.dumps(data, ensure_ascii=False), fp, now)
             )
         after = conn.execute("SELECT COUNT(*) FROM nodes").fetchone()[0]
         conn.commit()
@@ -290,10 +316,20 @@ def apply_check_results(results: List[dict]) -> dict:
     with get_connection() as conn:
         # 用户手动删除过的节点不复活
         tombstoned = _tombstoned_fingerprints(conn)
+        # 用户自定义名优先于测速引擎返回的名称
+        custom_names = _custom_names(conn)
         for r in results:
             fp = node_fingerprint(r["node_type"], r["node_data"])
             if fp in tombstoned:
                 continue
+            upstream_name = r.get("node_name", "")
+            keep = custom_names.get(fp)
+            node_name = keep if keep else upstream_name
+            # ⚠ node_data 会被测速结果整体覆盖，custom_name 必须一起带过去，
+            # 否则本轮就把用户的自定义名抹掉了（下一轮就找不到它）
+            data = dict(r["node_data"])
+            if keep:
+                data["custom_name"] = keep
             conn.execute(
                 """INSERT INTO nodes (subscribe_url, source_id, node_name, node_type, node_data,
                                       status, fingerprint, download_speed, latency, country,
@@ -309,7 +345,7 @@ def apply_check_results(results: List[dict]) -> dict:
                        stream_flags = COALESCE(excluded.stream_flags, nodes.stream_flags),
                        last_checked_at = excluded.last_checked_at,
                        last_seen_at = excluded.last_seen_at""",
-                (r.get("node_name", ""), r["node_type"], json.dumps(r["node_data"]), fp,
+                (node_name, r["node_type"], json.dumps(data, ensure_ascii=False), fp,
                  r.get("download_speed"), r.get("latency"), r.get("country"),
                  r.get("stream_flags"), now, now)
             )
@@ -578,6 +614,15 @@ def get_connection():
 # ===== Source CRUD =====
 
 def add_source(name: str, url: str, source_type: str = "unknown") -> Optional[Source]:
+    # 已被用户删除的源不允许重新入库（否则「导入预置源」会把删掉的源复活）
+    try:
+        with get_connection() as conn:
+            if conn.execute("SELECT 1 FROM deleted_source_tombstones WHERE url = ?",
+                            (url,)).fetchone():
+                logger.info("Source blocked (tombstoned): %s", name)
+                return None
+    except Exception as e:
+        logger.warning("check source tombstone failed: %s", e)
     with get_connection() as conn:
         cursor = conn.execute(
             "INSERT INTO sources (name, url, source_type) VALUES (?, ?, ?)",
@@ -649,6 +694,126 @@ def set_source_speed_test(source_id: int, speed_test: int = 1):
         )
 
 
+# ===== 源删除（硬删 + URL 墓碑防复活）=====
+
+def deleted_source_urls(conn=None) -> set:
+    """已删除源的 URL 集合——用于阻断复活路径"""
+    own = conn is None
+    ctx = get_connection() if own else _NullCtx(conn)
+    with ctx as c:
+        rows = c.execute("SELECT url FROM deleted_source_tombstones").fetchall()
+    return {r[0] for r in rows if r[0]}
+
+
+class _NullCtx:
+    """把已有 connection 包成 contextmanager（避免重复 get_connection）"""
+    def __init__(self, conn):
+        self.conn = conn
+
+    def __enter__(self):
+        return self.conn
+
+    def __exit__(self, *a):
+        return False
+
+
+def delete_sources(source_ids: List[int]) -> dict:
+    """删除数据源（硬删 + URL 墓碑）。
+
+    单纯把 enabled 置 0 是不够的——源会以三种方式复活：
+      ① 预置源：下次点「导入预置源」时 URL 唯一约束失效→重新入库
+      ② fail_count>=5：24 小时后 reenable_expired_sources() 自动重启用
+      ③ 抓取成功：record_source_success() 把 enabled 强制置 1
+    因此删除时把 URL 写入墓碑表，三条复活路径全部拦截。
+
+    SQLite 连接未开 foreign_keys，nodes.source_id 的 ON DELETE CASCADE 不生效，
+    关联节点需手动清理（节点走硬删 + 节点墓碑，防止下轮抓取复活）。
+    """
+    if not source_ids:
+        return {"deleted": 0, "tombstoned": 0, "nodes_deleted": 0}
+    ids = list(dict.fromkeys(int(i) for i in source_ids))
+    deleted = 0
+    tombstoned = 0
+    nodes_deleted = 0
+    now = int(__import__('time').time())
+    with get_connection() as conn:
+        for i in range(0, len(ids), 900):
+            chunk = ids[i:i + 900]
+            placeholders = ",".join("?" * len(chunk))
+            rows = conn.execute(
+                f"SELECT id, url, name, source_type FROM sources WHERE id IN ({placeholders})",
+                chunk).fetchall()
+            if not rows:
+                continue
+            for r in rows:
+                cur = conn.execute(
+                    """INSERT OR IGNORE INTO deleted_source_tombstones
+                       (url, name, source_type, deleted_at) VALUES (?, ?, ?, ?)""",
+                    (r["url"], r["name"], r["source_type"], now))
+                tombstoned += cur.rowcount or 0
+            src_ids = [r["id"] for r in rows]
+            rp = ",".join("?" * len(src_ids))
+            # 手动清理关联节点（foreign_keys 未开启，CASCADE 不生效）
+            node_rows = conn.execute(
+                f"SELECT id, fingerprint, node_type, node_data FROM nodes WHERE source_id IN ({rp})",
+                src_ids).fetchall()
+            if node_rows:
+                # 节点同样落墓碑，防止下轮抓取把被删源的节点导回来
+                for nr in node_rows:
+                    fp = nr["fingerprint"]
+                    if not fp:
+                        continue
+                    data = _parse_node_data(nr["node_data"])
+                    conn.execute(
+                        """INSERT OR IGNORE INTO deleted_node_tombstones
+                           (fingerprint, node_type, server, port, deleted_at) VALUES (?, ?, ?, ?, ?)""",
+                        (fp, nr["node_type"], str(data.get("server", "")).strip().lower(),
+                         int(data.get("port", 0) or 0), now))
+                nids = [nr["id"] for nr in node_rows]
+                # SQLite 参数上限 999，分批清理关联子表
+                for j in range(0, len(nids), 900):
+                    nchunk = nids[j:j + 900]
+                    np = ",".join("?" * len(nchunk))
+                    conn.execute(f"DELETE FROM node_gfw_status WHERE node_id IN ({np})", nchunk)
+                    conn.execute(f"DELETE FROM node_health_history WHERE node_id IN ({np})", nchunk)
+                cur = conn.execute(f"DELETE FROM nodes WHERE id IN ({rp})", src_ids)
+                nodes_deleted += cur.rowcount or 0
+            cur = conn.execute(f"DELETE FROM sources WHERE id IN ({rp})", src_ids)
+            deleted += cur.rowcount or 0
+    return {"deleted": deleted, "tombstoned": tombstoned, "nodes_deleted": nodes_deleted}
+
+
+def list_source_tombstones(limit: int = 200) -> list:
+    """已删除源墓碑列表"""
+    with get_connection() as conn:
+        rows = conn.execute(
+            "SELECT id, url, name, source_type, deleted_at "
+            "FROM deleted_source_tombstones ORDER BY deleted_at DESC LIMIT ?",
+            (limit,)).fetchall()
+        return [dict(r) for r in rows]
+
+
+def restore_source_tombstones(urls: Optional[List[str]] = None) -> int:
+    """清除源墓碑（urls 为空表示全部清除），解除复活拦截"""
+    with get_connection() as conn:
+        if not urls:
+            cur = conn.execute("DELETE FROM deleted_source_tombstones")
+            return cur.rowcount or 0
+        n = 0
+        for i in range(0, len(urls), 900):
+            chunk = urls[i:i + 900]
+            placeholders = ",".join("?" * len(chunk))
+            cur = conn.execute(
+                f"DELETE FROM deleted_source_tombstones WHERE url IN ({placeholders})", chunk)
+            n += cur.rowcount or 0
+        return n
+
+
+def count_source_tombstones() -> int:
+    with get_connection() as conn:
+        return conn.execute("SELECT COUNT(*) FROM deleted_source_tombstones").fetchone()[0]
+
+
 # ===== Node CRUD =====
 
 def add_node(subscribe_url: str, source_id: Optional[int], node_name: str, node_type: str, node_data: dict, status: Optional[str] = None) -> Node:
@@ -695,7 +860,7 @@ def list_nodes(status: Optional[str] = None, country: Optional[str] = None, node
                limit: int = 100, min_score: Optional[float] = None, min_speed: Optional[float] = None,
                max_latency: Optional[int] = None, sort: str = "latency", order: str = "asc",
                offset: int = 0, source_type: Optional[str] = None,
-               category: Optional[str] = None) -> List[Node]:
+               category: Optional[str] = None, country_code: Optional[str] = None) -> List[Node]:
     with get_connection() as conn:
         query = "SELECT n.* FROM nodes n LEFT JOIN sources s ON n.source_id = s.id WHERE 1=1"
         params = []
@@ -710,6 +875,9 @@ def list_nodes(status: Optional[str] = None, country: Optional[str] = None, node
         if country:
             query += " AND n.country = ?"
             params.append(country)
+        if country_code:
+            query += " AND UPPER(n.country_code) = ?"
+            params.append(str(country_code).strip().upper())
         if node_type:
             query += " AND n.node_type = ?"
             params.append(node_type)
@@ -751,10 +919,45 @@ def list_nodes(status: Optional[str] = None, country: Optional[str] = None, node
 def update_node_status(node_id: int, status: str, latency: Optional[int] = None, download_speed: Optional[int] = None):
     with get_connection() as conn:
         conn.execute(
-            """UPDATE nodes SET status = ?, latency = ?, download_speed = ?, 
+            """UPDATE nodes SET status = ?, latency = ?, download_speed = ?,
                last_checked_at = ?, updated_at = ? WHERE id = ?""",
             (status, latency, download_speed, int(__import__('time').time()), int(__import__('time').time()), node_id)
         )
+
+
+def rename_node(node_id: int, new_name: str) -> bool:
+    """节点重命名。
+
+    用户自定义名写入 node_name；同时在 node_data 里存一份 custom_name，
+    避免下一轮抓取/测速回填时被上游名称覆盖（upsert 的 node_name 取上游值）。
+    """
+    name = (new_name or "").strip()
+    if not name:
+        return False
+    with get_connection() as conn:
+        row = conn.execute("SELECT node_data FROM nodes WHERE id = ?", (node_id,)).fetchone()
+        if not row:
+            return False
+        data = _parse_node_data(row["node_data"])
+        data["custom_name"] = name
+        conn.execute(
+            "UPDATE nodes SET node_name = ?, node_data = ?, updated_at = ? WHERE id = ?",
+            (name, json.dumps(data, ensure_ascii=False), int(__import__('time').time()), node_id)
+        )
+    return True
+
+
+def list_custom_named_nodes() -> Dict[int, str]:
+    """所有带自定义名的节点 {node_id: custom_name}（回填时优先使用）"""
+    out: Dict[int, str] = {}
+    with get_connection() as conn:
+        rows = conn.execute("SELECT id, node_data FROM nodes").fetchall()
+    for r in rows:
+        d = _parse_node_data(r["node_data"])
+        cn = d.get("custom_name")
+        if cn:
+            out[r["id"]] = str(cn)
+    return out
 
 
 def update_node_location(node_id: int, country: Optional[str] = None, provider: Optional[str] = None):
@@ -1249,9 +1452,18 @@ def record_source_failure(source_id: int, auto_disable_threshold: int = 5, disab
 
 
 def record_source_success(source_id: int):
-    """记录源抓取成功，重置失败计数并确保启用（手动重试成功即恢复）"""
+    """记录源抓取成功，重置失败计数并确保启用（手动重试成功即恢复）
+
+    ⚠ 已被用户删除的源（墓碑）不再复活——墓碑优先于成功回填。
+    """
     now = int(__import__('time').time())
     with get_connection() as conn:
+        row = conn.execute("SELECT url FROM sources WHERE id = ?", (source_id,)).fetchone()
+        if not row:
+            return
+        if conn.execute("SELECT 1 FROM deleted_source_tombstones WHERE url = ?",
+                        (row["url"],)).fetchone():
+            return
         conn.execute(
             "UPDATE sources SET fail_count = 0, enabled = 1, updated_at = ? WHERE id = ?",
             (now, source_id)
@@ -1259,11 +1471,16 @@ def record_source_success(source_id: int):
 
 
 def reenable_expired_sources(disable_hours: int = 24):
-    """恢复禁用超时的源（禁用满 disable_hours 自动重新启用）"""
+    """恢复禁用超时的源（禁用满 disable_hours 自动重新启用）
+
+    ⚠ 已被用户删除的源（墓碑）不参与自动复活。
+    """
     now = int(__import__('time').time())
     with get_connection() as conn:
         rows = conn.execute(
-            "SELECT id, updated_at FROM sources WHERE enabled = 0 AND fail_count >= 5"
+            "SELECT s.id, s.updated_at, s.url FROM sources s "
+            "WHERE s.enabled = 0 AND s.fail_count >= 5 "
+            "AND s.url NOT IN (SELECT url FROM deleted_source_tombstones)"
         ).fetchall()
         reenabled = 0
         for r in rows:
@@ -1405,6 +1622,19 @@ def _tombstoned_fingerprints(conn) -> set:
     return {r[0] for r in rows if r[0]}
 
 
+def _custom_names(conn) -> Dict[str, str]:
+    """用户自定义名 {fingerprint: custom_name}——写入路径据此保留用户命名"""
+    out: Dict[str, str] = {}
+    rows = conn.execute(
+        "SELECT fingerprint, node_data FROM nodes WHERE fingerprint IS NOT NULL").fetchall()
+    for r in rows:
+        d = _parse_node_data(r["node_data"])
+        cn = d.get("custom_name")
+        if cn:
+            out[r["fingerprint"]] = str(cn)
+    return out
+
+
 def delete_nodes(node_ids: List[int]) -> dict:
     """删除节点（硬删除 + 指纹墓碑）。
 
@@ -1484,14 +1714,22 @@ def restore_tombstones(fingerprints: Optional[List[str]] = None) -> int:
         return cur.rowcount or 0
 
 
-def list_node_ids_by_status(statuses: List[str]) -> List[int]:
-    """按状态取节点 id（用于一键清理不可用节点）"""
+def list_node_ids_by_status(statuses: List[str], include_manual: bool = False) -> List[int]:
+    """按状态取节点 id（用于一键清理不可用节点）
+
+    include_manual=False（默认）时**排除手动导入的节点**——
+    用户手动加的节点是自己的资产（如自购机场订阅），一键清理误删代价高。
+    """
     if not statuses:
         return []
     with get_connection() as conn:
         placeholders = ",".join("?" * len(statuses))
-        rows = conn.execute(
-            f"SELECT id FROM nodes WHERE status IN ({placeholders})", list(statuses)).fetchall()
+        sql = f"SELECT id FROM nodes WHERE status IN ({placeholders})"
+        params = list(statuses)
+        if not include_manual:
+            sql += (" AND (source_id IS NULL OR source_id NOT IN "
+                    "(SELECT id FROM sources WHERE source_type = 'manual'))")
+        rows = conn.execute(sql, params).fetchall()
         return [r[0] for r in rows]
 
 
@@ -1507,6 +1745,31 @@ def count_nodes_by_source_type(source_type: str) -> int:
             "SELECT COUNT(*) FROM nodes WHERE source_id IN (SELECT id FROM sources WHERE source_type = ?)",
             (source_type,)).fetchone()
         return row[0] if row else 0
+
+
+def list_manual_node_ids() -> List[int]:
+    """手动导入的节点 id 列表（一键清理默认跳过它们）"""
+    with get_connection() as conn:
+        rows = conn.execute(
+            "SELECT id FROM nodes WHERE source_id IN "
+            "(SELECT id FROM sources WHERE source_type = 'manual')").fetchall()
+        return [r[0] for r in rows]
+
+
+def list_countries() -> list:
+    """库内出现过的国家/地区列表 [{country, country_code, count}]，按节点数降序
+
+    用于节点列表的「国家/地区」筛选下拉。
+    """
+    with get_connection() as conn:
+        rows = conn.execute(
+            "SELECT country, country_code, COUNT(*) AS n FROM nodes "
+            "WHERE (country IS NOT NULL AND country != '') "
+            "   OR (country_code IS NOT NULL AND country_code != '') "
+            "GROUP BY country, country_code ORDER BY n DESC LIMIT 200"
+        ).fetchall()
+    return [{"country": r["country"], "country_code": r["country_code"], "count": r["n"]}
+            for r in rows]
 
 
 # ===== 运行时配置（管理面板保存，落库）=====
