@@ -2243,10 +2243,10 @@
                         <div style="flex:1;min-width:220px;">
                             <h4 style="margin-bottom:8px;">✂️ 分来源订阅</h4>
                             <div class="flex" style="gap:8px;flex-wrap:wrap;">
-                                <button class="btn btn-secondary" onclick="copyText('${location.origin}/api/nodes/subscribe?fmt=clash&src=manual')">🛠 仅手动导入</button>
-                                <button class="btn btn-secondary" onclick="copyText('${location.origin}/api/nodes/subscribe?fmt=clash&src=auto')">🤖 仅系统优选</button>
+                                <button class="btn btn-secondary" id="copy-src-manual" onclick="copySrcSub('manual', this)">🛠 仅手动导入</button>
+                                <button class="btn btn-secondary" id="copy-src-auto" onclick="copySrcSub('auto', this)">🤖 仅系统优选</button>
                             </div>
-                            <p class="text-muted" style="font-size:11px;margin-top:8px;">把 fmt=clash 换成 v2ray/singbox/base64/txt 可切换格式</p>
+                            <p class="text-muted" style="font-size:11px;margin-top:8px;">使用 Token 短链（/sub/{token}/clash），客户端可直接拉取。fmt 可换 v2ray/singbox/base64/txt</p>
                         </div>
                     </div>
                 </div>
@@ -2303,14 +2303,38 @@
                     </div>
                 </div>
             `;
+            genAggLink();   // 进入页面自动生成一次聚合订阅（Token 短链）
         }
 
         let lastSubLink = '';
+        // 订阅链接统一走 Token 短链 /sub/{token}/{fmt}
+        // ⚠ /api/nodes/subscribe 已收紧为需登录会话——生成的链接要放进
+        //   Clash/v2rayN 等客户端拉取，客户端不带浏览器 cookie，必须用 token 短链
+        let _subTokenPromise = null;
+        function getSubToken() {
+            if (!_subTokenPromise) {
+                _subTokenPromise = fetch(`${API}/tokens/full`, { credentials: 'same-origin' })
+                    .then(r => r.json())
+                    .then(tokens => {
+                        const active = (tokens || []).find(t => t.is_active);
+                        return active ? active.token : null;
+                    })
+                    .catch(() => null);
+            }
+            return _subTokenPromise;
+        }
         async function genAggLink() {
             const fmt = document.getElementById('agg-fmt').value;
             const cat = document.getElementById('agg-category') ? document.getElementById('agg-category').value : '';
-            const link = `${location.origin}/api/nodes/subscribe?fmt=${fmt}&limit=5000` + (cat ? `&category=${cat}` : '');
+            const token = await getSubToken();
             const el = document.getElementById('agg-link');
+            if (!token) {
+                el.innerHTML = '<span style="color:#dc2626;">⚠ 未创建订阅 Token——请先到「🔑 令牌管理」创建</span>';
+                el.style.display = 'block';
+                window._aggLink = '';
+                return;
+            }
+            const link = `${location.origin}/sub/${token}/${fmt}?limit=5000` + (cat ? `&category=${cat}` : '');
             el.textContent = link; el.style.display = 'block';
             window._aggLink = link;
             renderSubQRTo('agg-qr', link);
@@ -2320,7 +2344,15 @@
             } catch(e) {}
         }
         function copyAggLink() {
-            const link = window._aggLink || `${location.origin}/api/nodes/subscribe?fmt=clash&limit=5000`;
+            const link = window._aggLink;
+            if (!link) { showToast('请先生成链接', 'error'); return; }
+            copyText(link);
+        }
+        // 分来源订阅复制（Token 短链 + src 参数）
+        async function copySrcSub(src, btn) {
+            const token = await getSubToken();
+            if (!token) { showToast('未创建订阅 Token——请先到「令牌管理」创建', 'error'); return; }
+            const link = `${location.origin}/sub/${token}/clash?src=${src}`;
             copyText(link);
         }
         function copyText(text) {
@@ -2903,7 +2935,7 @@
             }
         }
 
-        function buildPremiumLink() {
+        async function buildPremiumLink() {
             const fmt = document.getElementById('pv-fmt').value;
             const parts = [`limit=5000`];
             const ms = document.getElementById('pv-minscore').value;
@@ -2914,9 +2946,17 @@
             if (ml) parts.push(`max_latency=${ml}`);
             if (c) parts.push(`country=${encodeURIComponent(c)}`);
             if (p) parts.push(`proto=${encodeURIComponent(p)}`);
-            const link = `${location.origin}/api/nodes/subscribe?fmt=${fmt}&${parts.join('&')}`;
+            const token = await getSubToken();
+            const link = token
+                ? `${location.origin}/sub/${token}/${fmt}?${parts.join('&')}`
+                : '';
             window._pvLink = link;
-            document.getElementById('pv-link').textContent = link;
+            const linkEl = document.getElementById('pv-link');
+            if (!token) {
+                linkEl.innerHTML = '<span style="color:#dc2626;">⚠ 未创建订阅 Token——请先到「🔑 令牌管理」创建</span>';
+            } else {
+                linkEl.textContent = link;
+            }
             document.getElementById('pv-copy').style.display = '';
             document.getElementById('pv-link-box').style.display = '';
             const qr = document.getElementById('pv-qr');
@@ -3013,12 +3053,19 @@
                 new QRCode(container, { text, width: 180, height: 180, colorDark: '#2563eb', colorLight: '#ffffff', correctLevel: QRCode.CorrectLevel.M });
             } catch(e) { container.innerHTML = '<span class="text-muted">QR 生成失败</span>'; }
         }
-        function genSubLink() {
+        async function genSubLink() {
             const fmt = document.getElementById('sub-fmt').value;
             const limit = document.getElementById('sub-limit').value || 100;
             const minScore = document.getElementById('sub-minscore').value || 0;
-            lastSubLink = `${location.origin}/api/nodes/subscribe?fmt=${fmt}&limit=${limit}&min_score=${minScore}`;
+            const token = await getSubToken();
             const el = document.getElementById('sub-link');
+            if (!token) {
+                el.innerHTML = '<span style="color:#dc2626;">⚠ 未创建订阅 Token——请先到「🔑 令牌管理」创建</span>';
+                el.style.display = 'block';
+                lastSubLink = '';
+                return;
+            }
+            lastSubLink = `${location.origin}/sub/${token}/${fmt}?limit=${limit}&min_score=${minScore}`;
             el.textContent = lastSubLink;
             el.style.display = 'block';
             document.getElementById('sub-open').href = lastSubLink;
