@@ -1832,6 +1832,26 @@ def count_nodes_by_source_type(source_type: str) -> int:
         return row[0] if row else 0
 
 
+def count_nodes_by_source() -> Dict[int, int]:
+    """每个源当前实际关联的节点数 {source_id: count}。
+
+    ⚠ sources.node_count 是"最近一轮抓取解析到的节点数"（含去重前/已被
+      指纹合并进其它源的），与库内实际归属数会对不上——展示口径必须用这个。
+    """
+    with get_connection() as conn:
+        rows = conn.execute(
+            "SELECT source_id, COUNT(*) AS n FROM nodes "
+            "WHERE source_id IS NOT NULL GROUP BY source_id").fetchall()
+    return {r["source_id"]: r["n"] for r in rows}
+
+
+def count_orphan_nodes() -> int:
+    """无源归属的节点数（测速回填时按指纹插入、上游源未关联的）"""
+    with get_connection() as conn:
+        return conn.execute(
+            "SELECT COUNT(*) FROM nodes WHERE source_id IS NULL").fetchone()[0]
+
+
 def list_manual_node_ids() -> List[int]:
     """手动导入的节点 id 列表（一键清理默认跳过它们）"""
     with get_connection() as conn:

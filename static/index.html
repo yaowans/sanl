@@ -1626,12 +1626,19 @@
 
                 const healthy = _srcHealth.filter(h => h.state === 'healthy').length;
                 const unhealthy = _srcHealth.filter(h => h.state === 'unhealthy').length;
-                const nodeCount = (stats && stats.total) || 0;  // 真实节点总数（源未关联节点时 reduce 恒为 0）
+                // 累计节点 = 各源当前实际关联节点数之和 + 无源归属（测速回填）节点
+                // ⚠ 不能用 nodes/stats.total 之外的口径混搭，也不能用 sources.node_count
+                //   （那是"上次抓取解析数"，与库内归属对不上，用户看到的数字会互相矛盾）
+                const actualSum = _srcHealth.reduce((a, h) => a + (h.actual_nodes || 0), 0);
+                const orphan = _srcHealth.length ? (stats && stats.pool_total
+                    ? Math.max(0, stats.pool_total - actualSum) : 0) : 0;
+                const nodeCount = actualSum;
                 healthEl.innerHTML = `
                     <div class="stat-card"><div class="stat-value">${_srcAll.length}</div><div class="stat-label">数据源总数</div></div>
                     <div class="stat-card"><div class="stat-value" style="color:#16a34a;">${healthy}</div><div class="stat-label">健康源</div></div>
                     <div class="stat-card"><div class="stat-value" style="color:#dc2626;">${unhealthy}</div><div class="stat-label">异常源</div></div>
-                    <div class="stat-card"><div class="stat-value" style="color:#2563eb;">${nodeCount}</div><div class="stat-label">累计节点</div></div>
+                    <div class="stat-card"><div class="stat-value" style="color:#2563eb;">${nodeCount}</div>
+                        <div class="stat-label">累计节点${orphan > 0 ? `（另有 ${orphan} 个测速回填）` : ''}</div></div>
                 `;
                 renderSourcesTable();
             } catch(e) { console.error(e); showToast('数据源加载失败: ' + (e.message||'网络错误'), 'error'); }
@@ -1676,11 +1683,14 @@
                             : `<span class="badge badge-danger">异常${(s.fail_count||0) >= 3 ? '×'+s.fail_count : ''}</span>`;
                 const checked = _srcSelected.has(s.id) ? ' checked' : '';
                 const disabledTag = s.enabled ? '' : ' <span class="badge badge-secondary">已禁用</span>';
+                // 节点数显示库内真实归属（h.actual_nodes），title 里附"上次解析数"备查
+                const h = healthMap.get(s.id);
+                const actualN = h ? (h.actual_nodes ?? s.node_count ?? 0) : (s.node_count || 0);
                 return `<tr><td><input type="checkbox" class="src-cb" data-id="${s.id}"${checked} onchange="toggleSourceSelect(${s.id}, this.checked)"></td>
                     <td>${escHtml(s.name || '')}${disabledTag}</td>
                     <td style="max-width:280px;overflow:hidden;text-overflow:ellipsis;font-size:12px;" title="${escHtml(s.url||'')}">${escHtml(s.url||'')}</td>
                     <td><span class="badge badge-info">${escHtml(s.source_type||'')}</span></td>
-                    <td>${s.node_count||0}</td>
+                    <td title="库内实际归属 ${actualN} 个；上次抓取解析 ${s.node_count||0} 个">${actualN}</td>
                     <td>${badge}</td>
                     <td>
                         <button class="btn btn-sm ${stest ? 'btn-primary' : 'btn-secondary'}" onclick="toggleSpeedTest(${s.id},${stest?0:1})"

@@ -1811,6 +1811,9 @@ async def get_sources_health():
     - 其余（启用但 fail_count>=3 / 禁用）→ unhealthy 异常
     """
     sources = repository.list_sources(enabled_only=False)
+    # 实际关联节点数（sources.node_count 是"上次抓取解析数"，与库内归属对不上）
+    actual_counts = repository.count_nodes_by_source()
+    orphan = repository.count_orphan_nodes()
     health = []
     for s in sources:
         if s.enabled == 1 and s.last_status == 1:
@@ -1828,6 +1831,8 @@ async def get_sources_health():
             "name": s.name,
             "url": s.url,
             "enabled": bool(s.enabled),
+            # actual_nodes = 库内真实归属；node_count 保留"上次解析数"语义
+            "actual_nodes": actual_counts.get(s.id, 0),
             "node_count": s.node_count,
             "last_status": s.last_status,
             "last_fetched_at": s.last_fetched_at,
