@@ -140,6 +140,13 @@ def create_app() -> FastAPI:
                             headers={"Cache-Control": "no-cache",
                                      "Service-Worker-Allowed": "/"})
 
+    # 客户端订阅指南（独立单页，不能被 SPA fallback 吞掉返回 index.html）
+    @app.get("/client-guide.html", include_in_schema=False)
+    async def client_guide():
+        return FileResponse(os.path.join(static_dir, "client-guide.html"),
+                            media_type="text/html; charset=utf-8",
+                            headers={"Cache-Control": "no-cache"})
+
     @app.get("/manifest.webmanifest", include_in_schema=False)
     async def webmanifest():
         return FileResponse(os.path.join(static_dir, "manifest.webmanifest"),
@@ -184,7 +191,8 @@ def create_app() -> FastAPI:
 
         # 静态资源与 PWA 清单：放行（登录页自身要加载）
         if (path.startswith("/static/") or path.startswith("/vendor/")
-                or path in ("/sw.js", "/manifest.webmanifest", "/favicon.ico")):
+                or path in ("/sw.js", "/manifest.webmanifest", "/favicon.ico",
+                            "/client-guide.html")):
             return await call_next(request)
 
         # 登录相关接口：放行
@@ -233,7 +241,8 @@ def create_app() -> FastAPI:
     async def spa_fallback(full_path: str):
         lower = full_path.lower()
         for prefix in ("api/", "sub/", "static/", "vendor/", "openapi.json",
-                       "docs", "redoc", "sw.js", "manifest.webmanifest", "favicon.ico"):
+                       "docs", "redoc", "sw.js", "manifest.webmanifest",
+                       "favicon.ico", "client-guide.html"):
             if lower == prefix.rstrip('/') or lower.startswith(prefix):
                 raise HTTPException(status_code=404)
         return FileResponse(os.path.join(static_dir, "index.html"))
