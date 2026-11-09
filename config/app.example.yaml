@@ -10,6 +10,21 @@ app:
 database:
   path: "./data/nodes.db" # SQLite；Docker 卷挂载 data/ 即可持久化
 
+# GFW 境内可达性检测（部署期兜底配置）
+# ⚠️ 推荐在管理面板「GFW 配置」页填写——保存后落库立即生效，无需重启容器。
+#    此处仅作为环境变量缺失时的兜底；优先级：管理面板保存(DB) > 环境变量 > 本文件 > 内置默认值
+#    环境变量：CN_PROBE_URL / CN_PROBE_KEY / CN_PROBE_ENABLED
+gfw:
+  enabled: false                       # 境内探针总开关
+  probe_url: ""                        # 探针地址，如 http://43.136.58.195:8899（不要带 /check）
+  probe_key: ""                        # 探针共享密钥（X-Probe-Key 请求头）
+  timeout: 3                           # 单目标 TCP 超时（秒），0.5~10
+  batch_size: 100                     # 单批目标数，1~500（探针上限 500）
+  check_limit: 5000                   # 单轮最多复核多少个 active 节点
+  auto_check: true                    # 测速结束后自动复核
+  filter_subscription: true            # 默认订阅只输出境内可达节点
+  downgrade_blocked: true             # 被墙节点降级为 inactive（不硬删除）
+
 subs_check:
   binary_path: "./subs-check"          # subs-check 二进制路径
   config_path: "./config/subs-check.yaml"

@@ -15,6 +15,7 @@ from typing import Dict, List, Optional, Tuple
 import httpx
 
 from .config import get_gfw_config
+from .settings import resolve_gfw_config
 
 logger = logging.getLogger(__name__)
 
@@ -25,14 +26,22 @@ _BATCH_TIMEOUT = 40.0
 
 
 def _probe_config() -> dict:
-    """读取探针配置：enabled / url / key / timeout"""
-    gfw = get_gfw_config()
+    """读取探针配置：enabled / url / key / timeout
+
+    配置来源：DB 覆盖（管理面板保存）> 环境变量 > app.yaml > 默认值。
+    见 src/settings.py。
+    """
+    cfg = resolve_gfw_config()
     return {
-        "enabled": bool(gfw.get("enabled", False)),
-        "url": (gfw.get("probe_url") or "").rstrip("/"),
-        "key": gfw.get("probe_key") or "",
-        "timeout": float(gfw.get("timeout", 3)),
-        "batch_size": int(gfw.get("batch_size", _BATCH_SIZE)),
+        "enabled": bool(cfg.get("gfw.enabled", False)),
+        "url": (cfg.get("gfw.probe_url") or "").rstrip("/"),
+        "key": cfg.get("gfw.probe_key") or "",
+        "timeout": float(cfg.get("gfw.timeout", 3)),
+        "batch_size": int(cfg.get("gfw.batch_size", _BATCH_SIZE)),
+        "check_limit": int(cfg.get("gfw.check_limit", 5000)),
+        "auto_check": bool(cfg.get("gfw.auto_check", True)),
+        "filter_subscription": bool(cfg.get("gfw.filter_subscription", True)),
+        "downgrade_blocked": bool(cfg.get("gfw.downgrade_blocked", True)),
     }
 
 

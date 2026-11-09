@@ -307,7 +307,7 @@ class Checker:
 
         探针未启用或不可用时直接跳过，不影响原有测速流程。
         """
-        from ..gfw import check_nodes, probe_enabled
+        from ..gfw import check_nodes, probe_enabled, _probe_config
         from ..utils.taskmgr import task_manager
 
         # 与 run_check 中使用的任务 ID 保持一致（该处为函数内局部变量）
@@ -316,8 +316,13 @@ class Checker:
         if not probe_enabled():
             return {"skipped": True, "reason": "探针未启用"}
 
-        # 只复核本轮判为 active 的节点
-        alive = repository.list_nodes(status="active", limit=5000)
+        cfg = _probe_config()
+        # 测速后自动复核开关（配置页可关）
+        if not cfg.get("auto_check", True):
+            return {"skipped": True, "reason": "已关闭「测速后自动复核」"}
+
+        # 只复核本轮判为 active 的节点，受「单轮检测节点上限」约束
+        alive = repository.list_nodes(status="active", limit=int(cfg.get("check_limit", 5000)))
         if not alive:
             return {"skipped": True, "reason": "无存活节点"}
 
@@ -339,7 +344,8 @@ class Checker:
             if r["blocked"]:
                 blocked_ids.append(nid)
 
-        if blocked_ids:
+        # 是否把被墙节点降级为 inactive 由配置决定（不硬删除，用户可手动删）
+        if blocked_ids and cfg.get("downgrade_blocked", True):
             # 降级为 inactive（存活但境内不可用）。订阅接口会额外按 GFW 结论过滤，
             # 这样既不动 banned（手动封禁）语义，又能保证默认订阅不含被墙节点。
             repository.mark_nodes_status(blocked_ids, "inactive")

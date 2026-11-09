@@ -106,6 +106,16 @@ def _migrate(conn):
     """)
     conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_nodes_fingerprint ON nodes(fingerprint)")
 
+    # 运行时可改配置（管理面板保存 → 落库）。
+    # 优先级：DB 覆盖 > 环境变量 > app.yaml > 内置默认值
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS app_settings (
+            key TEXT PRIMARY KEY,
+            value TEXT,
+            updated_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now'))
+        )
+    """)
+
     # CF 扫描结果表（官方/非标网段扫描输出）
     conn.execute("""
         CREATE TABLE IF NOT EXISTS cf_scan_results (
@@ -1497,6 +1507,45 @@ def count_nodes_by_source_type(source_type: str) -> int:
             "SELECT COUNT(*) FROM nodes WHERE source_id IN (SELECT id FROM sources WHERE source_type = ?)",
             (source_type,)).fetchone()
         return row[0] if row else 0
+
+
+# ===== 运行时配置（管理面板保存，落库）=====
+
+def get_app_settings() -> Dict[str, str]:
+    """读取所有运行时配置覆盖项"""
+    with get_connection() as conn:
+        rows = conn.execute("SELECT key, value FROM app_settings").fetchall()
+    return {r["key"]: r["value"] for r in rows}
+
+
+def set_app_settings(values: Dict[str, str]) -> int:
+    """批量写入运行时配置（幂等覆盖）。返回写入条数。"""
+    if not values:
+        return 0
+    now = int(__import__('time').time())
+    with get_connection() as conn:
+        for k, v in values.items():
+            conn.execute(
+                """INSERT INTO app_settings (key, value, updated_at) VALUES (?, ?, ?)
+                   ON CONFLICT(key) DO UPDATE SET value = excluded.value,
+                                                updated_at = excluded.updated_at""",
+                (str(k), "" if v is None else str(v), now))
+    return len(values)
+
+
+def delete_app_settings(keys: List[str]) -> int:
+    """清除运行时配置覆盖（回落到 app.yaml / 环境变量）"""
+    if not keys:
+        return 0
+    n = 0
+    with get_connection() as conn:
+        for i in range(0, len(keys), 900):
+            chunk = keys[i:i + 900]
+            placeholders = ",".join("?" * len(chunk))
+            cur = conn.execute(
+                f"DELETE FROM app_settings WHERE key IN ({placeholders})", chunk)
+            n += cur.rowcount or 0
+    return n
 
 
 def apply_qualified_latency(threshold_ms: int) -> int:

@@ -185,6 +185,7 @@
                 <div class="nav-item" data-page="sources">📡 来源管理</div>
                 <div class="nav-item" data-page="check">⚡ 测速任务</div>
                 <div class="nav-item" data-page="gfw">🛡 GFW 检测</div>
+                <div class="nav-item" data-page="gfwconfig">⚙️ GFW 配置</div>
                 <div class="nav-item" data-page="cfendpoints">☁️ CF 优选</div>
                 <div class="nav-group" i18n-group="sub">🔄 订阅转换</div>
                 <div class="nav-item" data-page="convert">🔄 订阅转换</div>
@@ -292,6 +293,7 @@
                 {id:'sources', icon:'📡', zh:'来源管理', en:'Sources'},
                 {id:'check', icon:'⚡', zh:'测速任务', en:'Speed Test'},
                 {id:'gfw', icon:'🛡', zh:'GFW 检测', en:'GFW Check'},
+                {id:'gfwconfig', icon:'⚙️', zh:'GFW 配置', en:'GFW Config'},
                 {id:'cfendpoints', icon:'☁️', zh:'CF 优选', en:'CF Hub'},
             ]},
             { id:'sub', icon:'🔄', zh:'订阅转换', en:'Subscription', home:'convert', pages:[
@@ -331,6 +333,7 @@
                 case 'cfendpoints': renderCfEndpoints(body || main); break;
                 case 'check': renderCheck(body || main); break;
                 case 'gfw': renderGfw(body || main); break;
+                case 'gfwconfig': renderGfwConfig(body || main); break;
                 case 'convert': renderConvert(body || main); break;
                 case 'cfworker': renderCfWorker(body || main); break;
                 case 'subscribe': renderSubscribe(body || main); break;
@@ -2087,10 +2090,14 @@
         async function renderGfw(main) {
             main.innerHTML = `
                 <div class="page-header"><h1 class="page-title">🛡 GFW 境内可达性检测</h1>
-                    <button class="btn btn-secondary" onclick="goPage('gfw')">🔄 刷新</button></div>
+                    <div class="flex">
+                        <button class="btn btn-secondary" onclick="gfwCfgReload()">🔄 刷新</button>
+                        <button class="btn btn-primary" onclick="goPage('gfwconfig')">⚙️ 检测配置</button>
+                    </div></div>
                 <div style="background:var(--card);border:1px solid var(--bd);border-radius:10px;padding:14px;margin-bottom:14px;font-size:13px;line-height:1.7;color:var(--text-muted);">
                     服务器在境外时，境外测速只能证明「服务器能连上」，但 GFW 会让境内用户连不上这些节点。
                     本页调用部署在<strong>中国大陆境内</strong>的探针服务复核 IP:端口 的境内可达性，把「境外连通但境内被墙」的节点识别出来。
+                    探针地址、密钥等参数已改为可配置，请到 <a href="#" onclick="goPage('gfwconfig');return false;" style="color:var(--primary);">GFW 配置</a> 页调整。
                 </div>
                 <div class="stats-grid" style="grid-template-columns:repeat(auto-fit,minmax(150px,1fr));">
                     <div class="stat-card"><div class="stat-value" id="gfw-probe-state">—</div><div class="stat-label">探针状态</div></div>
@@ -2118,7 +2125,8 @@
                     st.textContent = '未启用'; st.style.color = '#94a3b8';
                     ip.textContent = '—';
                     document.getElementById('gfw-msg').innerHTML =
-                        '探针未启用。在 <code>config/app.yaml</code> 的 <code>gfw</code> 段配置 <code>enabled: true</code>、<code>probe_url</code>、<code>probe_key</code>，或用环境变量 <code>CN_PROBE_URL</code> / <code>CN_PROBE_KEY</code> / <code>CN_PROBE_ENABLED</code>。';
+                        '探针未启用。请到 <a href="#" onclick="goPage(\'gfwconfig\');return false;" style="color:var(--primary);">GFW 配置</a> 页填写探针地址与密钥，并打开「启用 GFW 检测」开关。'
+                        + '<br>部署期也可通过环境变量 <code>CN_PROBE_URL</code> / <code>CN_PROBE_KEY</code> / <code>CN_PROBE_ENABLED</code> 或 <code>config/app.yaml</code> 的 <code>gfw</code> 段配置。';
                     return;
                 }
                 if (d.ok) {
@@ -2240,6 +2248,236 @@
             } catch (e) {
                 document.getElementById('gfw-msg').textContent = '失败: ' + e.message;
             }
+        }
+
+        // ===== ⚙️ GFW 配置（可配置化，替代写死的环境变量）=====
+        let _gfwCfgItems = [];
+
+        async function renderGfwConfig(main) {
+            main.innerHTML = `
+                <div style="padding:24px;max-width:900px;">
+                    <div class="page-header"><h1 class="page-title">⚙️ GFW 检测配置</h1>
+                        <button class="btn btn-secondary" onclick="gfwCfgReload()">🔄 重新加载</button></div>
+
+                    <div style="background:var(--card,#fff);border:1px solid var(--border,#e2e8f0);border-radius:14px;padding:20px;margin-bottom:16px;">
+                        <h3 style="margin:0 0 12px;font-size:16px;">📋 配置说明</h3>
+                        <p style="margin:0 0 10px;color:var(--text-muted);font-size:14px;line-height:1.7;">
+                            服务器在境外时，境外测速只能证明「服务器能连上」，但 GFW 会让境内用户连不上这些节点。
+                            本模块调用部署在<strong>中国大陆境内</strong>的探针服务（cn-probe）复核
+                            <code>IP:端口</code> 的境内可达性，把「境外连通但境内被墙」的节点识别出来。
+                        </p>
+                        <ul style="margin:0;padding-left:20px;color:var(--text-muted);font-size:13px;line-height:1.9;">
+                            <li>探针必须部署在<strong>境内</strong> VPS / 家宽小鸡上，否则检测结果不具备判别力</li>
+                            <li>探针与本程序之间用共享密钥（<code>X-Probe-Key</code> 请求头）鉴权，防止被滥用</li>
+                            <li>配置保存后<strong>立即生效</strong>，无需重启容器；探针不可用时检测会被跳过，不会误杀节点</li>
+                            <li>配置优先级：<code>本页保存（数据库）</code> → 环境变量 <code>CN_PROBE_*</code> → <code>config/app.yaml</code> 的 <code>gfw</code> 段</li>
+                            <li>被墙节点只会被降级为 <code>inactive</code>（不进入默认订阅），<strong>不会硬删除</strong>，需要清理请到节点列表手动删</li>
+                        </ul>
+                    </div>
+
+                    <div style="background:var(--card,#fff);border:1px solid var(--border,#e2e8f0);border-radius:14px;padding:20px;margin-bottom:16px;">
+                        <h3 style="margin:0 0 4px;font-size:16px;">⚙️ 探针配置</h3>
+                        <p style="margin:0 0 16px;font-size:12px;color:var(--text-muted);">
+                            修改后点击「保存配置」落库生效；「测试连接」可先验证填写的地址是否可用（不落库）。
+                        </p>
+                        <div id="gfw-cfg-form" style="display:grid;gap:14px;">
+                            <div style="color:var(--text-muted);font-size:13px;">加载中…</div>
+                        </div>
+                        <div id="gfw-cfg-msg" style="font-size:13px;margin-top:14px;color:var(--text-muted);"></div>
+                        <div style="margin-top:16px;display:flex;gap:10px;flex-wrap:wrap;">
+                            <button class="btn btn-primary" id="gfw-cfg-save" onclick="gfwCfgSave(this)">💾 保存配置</button>
+                            <button class="btn btn-secondary" onclick="gfwCfgTest(this)">🔌 测试连接</button>
+                            <button class="btn btn-secondary" onclick="gfwCfgReset()">↩️ 恢复默认</button>
+                        </div>
+                    </div>
+
+                    <div id="gfw-cfg-deploy" style="background:var(--card,#fff);border:1px solid var(--border,#e2e8f0);border-radius:14px;padding:20px;margin-bottom:16px;">
+                        <h3 style="margin:0 0 12px;font-size:16px;">🖥️ 部署境内探针</h3>
+                        <p style="margin:0 0 12px;font-size:14px;color:var(--text-muted);line-height:1.7;">
+                            探针是<strong>零依赖单文件</strong> Python 程序（只用标准库），扔到任意国内小鸡上直接跑。
+                        </p>
+                        <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px;">
+                            <button class="btn btn-sm btn-secondary" onclick="gfwCfgLoadProbeScript()">📥 获取探针脚本</button>
+                            <button class="btn btn-sm btn-secondary" onclick="gfwCfgCopyProbeScript()">📋 复制脚本</button>
+                            <button class="btn btn-sm btn-secondary" onclick="gfwCfgDownloadProbeScript()">⬇️ 下载 cn_probe.py</button>
+                        </div>
+                        <div id="gfw-cfg-script" style="display:none;">
+                            <textarea id="gfw-cfg-script-text" style="width:100%;height:300px;font-family:monospace;font-size:12px;padding:12px;border:1px solid var(--border,#e2e8f0);border-radius:8px;resize:vertical;background:#1e293b;color:#e2e8f0;"></textarea>
+                            <h4 style="margin:14px 0 6px;font-size:14px;">📚 启动与自启</h4>
+                            <pre id="gfw-cfg-usage" style="background:var(--card,#fff);border:1px solid var(--border,#e2e8f0);border-radius:8px;padding:12px;font-size:12px;overflow:auto;line-height:1.7;"></pre>
+                        </div>
+                    </div>
+
+                    <div style="background:var(--card,#fff);border:1px solid var(--border,#e2e8f0);border-radius:14px;padding:20px;">
+                        <h3 style="margin:0 0 12px;font-size:16px;">🧪 验证效果</h3>
+                        <ol style="margin:0;padding-left:20px;color:var(--text-muted);font-size:14px;line-height:2;">
+                            <li>在「探针地址 / 探针密钥」填好境内探针信息，点「测试连接」确认出口 IP 在境内</li>
+                            <li>点「保存配置」，把总开关「启用 GFW 检测」打开</li>
+                            <li>到 <a href="#" onclick="goPage('gfw');return false;" style="color:var(--primary);">GFW 检测</a> 页点「检测当前可用节点」</li>
+                            <li>确认默认订阅输出的是境内可达节点（被墙节点已降级为 inactive）</li>
+                        </ol>
+                    </div>
+                </div>`;
+            await gfwCfgReload();
+        }
+
+        async function gfwCfgReload() {
+            const box = document.getElementById('gfw-cfg-form');
+            try {
+                const d = await (await fetch(`${API}/gfw/config`)).json();
+                _gfwCfgItems = d.items || [];
+                gfwCfgRenderForm();
+            } catch (e) {
+                if (box) box.innerHTML = '<div style="color:#dc2626;font-size:13px;">配置加载失败: ' + escHtml(e.message) + '</div>';
+            }
+        }
+
+        function gfwCfgRenderForm() {
+            const box = document.getElementById('gfw-cfg-form');
+            if (!box) return;
+            const SRC_LABEL = { db: '本页保存', env: '环境变量', yaml: 'app.yaml', default: '默认值' };
+            box.innerHTML = _gfwCfgItems.map(f => {
+                const src = SRC_LABEL[f.source] || f.source;
+                const badge = f.source === 'db'
+                    ? '<span class="badge badge-info" style="margin-left:6px;">已覆盖</span>'
+                    : `<span class="badge badge-secondary" style="margin-left:6px;" title="当前值来自 ${escHtml(src)}">${escHtml(src)}</span>`;
+                let control;
+                if (f.type === 'bool') {
+                    control = `<label style="display:inline-flex;align-items:center;gap:8px;cursor:pointer;">
+                        <input type="checkbox" data-gfw-key="${escHtml(f.key)}" data-gfw-type="bool" ${f.value ? 'checked' : ''}>
+                        <span style="font-size:13px;">${f.value ? '已开启' : '已关闭'}</span></label>`;
+                } else if (f.type === 'number') {
+                    control = `<input type="number" class="form-input" style="width:160px;"
+                        data-gfw-key="${escHtml(f.key)}" data-gfw-type="number"
+                        value="${f.value ?? ''}" min="${f.min ?? ''}" max="${f.max ?? ''}" step="${f.step ?? 1}">`;
+                } else if (f.type === 'password') {
+                    control = `<input type="password" class="form-input" style="width:100%;max-width:420px;"
+                        data-gfw-key="${escHtml(f.key)}" data-gfw-type="password"
+                        value="" placeholder="${escHtml(f.placeholder || (f.value || ''))}"
+                        autocomplete="new-password">`;
+                } else {
+                    control = `<input type="text" class="form-input" style="width:100%;max-width:420px;"
+                        data-gfw-key="${escHtml(f.key)}" data-gfw-type="text"
+                        value="${escHtml(f.value ?? '')}" placeholder="${escHtml(f.placeholder || '')}">`;
+                }
+                return `
+                <div>
+                    <div style="font-size:13px;font-weight:600;margin-bottom:6px;">${escHtml(f.label)}${badge}</div>
+                    ${control}
+                    <div style="font-size:12px;color:var(--text-muted);margin-top:6px;line-height:1.6;">${escHtml(f.help || '')}</div>
+                </div>`;
+            }).join('');
+            // 开关的 on/off 文案联动
+            box.querySelectorAll('input[data-gfw-type="bool"]').forEach(cb => {
+                cb.addEventListener('change', () => {
+                    const span = cb.parentElement.querySelector('span');
+                    if (span) span.textContent = cb.checked ? '已开启' : '已关闭';
+                });
+            });
+        }
+
+        function gfwCfgCollect() {
+            const values = {};
+            document.querySelectorAll('#gfw-cfg-form [data-gfw-key]').forEach(el => {
+                const key = el.dataset.gfwKey, type = el.dataset.gfwType;
+                if (type === 'bool') { values[key] = el.checked; return; }
+                if (type === 'password') {
+                    // 密码框留空 = 不改（后端脱敏回显，提交空串会清掉覆盖）
+                    if (el.value.trim()) values[key] = el.value.trim();
+                    return;
+                }
+                if (type === 'number') {
+                    const n = parseFloat(el.value);
+                    if (!isNaN(n)) values[key] = n;
+                    return;
+                }
+                values[key] = el.value.trim();
+            });
+            return values;
+        }
+
+        async function gfwCfgSave(btn) {
+            const values = gfwCfgCollect();
+            const msg = document.getElementById('gfw-cfg-msg');
+            btn.disabled = true; btn.textContent = '⏳ 保存中…';
+            try {
+                const d = await (await fetch(`${API}/gfw/config`, {
+                    method: 'POST', headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({values})
+                })).json();
+                if (d.detail) { msg.innerHTML = '<span style="color:#dc2626;">保存失败: ' + escHtml(d.detail) + '</span>'; return; }
+                _gfwCfgItems = d.items || [];
+                gfwCfgRenderForm();
+                msg.innerHTML = '<span style="color:#16a34a;">✅ 配置已保存并立即生效。</span>';
+            } catch (e) {
+                msg.innerHTML = '<span style="color:#dc2626;">保存失败: ' + escHtml(e.message) + '</span>';
+            }
+            btn.disabled = false; btn.textContent = '💾 保存配置';
+        }
+
+        async function gfwCfgTest(btn) {
+            const values = gfwCfgCollect();
+            const msg = document.getElementById('gfw-cfg-msg');
+            btn.disabled = true; btn.textContent = '⏳ 测试中…';
+            try {
+                const d = await (await fetch(`${API}/gfw/config/test`, {
+                    method: 'POST', headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({values})
+                })).json();
+                if (d.detail) { msg.innerHTML = '<span style="color:#dc2626;">测试失败: ' + escHtml(d.detail) + '</span>'; return; }
+                if (!d.ok) { msg.innerHTML = '<span style="color:#dc2626;">❌ 探针不可用: ' + escHtml(d.error || '未知错误') + '</span>'; return; }
+                const ip = d.egress_ip || '—';
+                const cn = /^(\d+\.){3}\d+$/.test(ip);
+                msg.innerHTML = `✅ 探针连通正常，鉴权通过。出口 IP：<b>${escHtml(ip)}</b>`
+                    + (cn ? '（看起来是境内地址，具备 GFW 判别力）' : '（⚠️ 不像境内地址，检测结果可能无法反映 GFW 拦截）');
+            } catch (e) {
+                msg.innerHTML = '<span style="color:#dc2626;">测试失败: ' + escHtml(e.message) + '</span>';
+            }
+            btn.disabled = false; btn.textContent = '🔌 测试连接';
+        }
+
+        async function gfwCfgReset() {
+            if (!confirm('确定恢复默认？本页保存的覆盖项会被清除，回落到环境变量 / app.yaml。')) return;
+            const msg = document.getElementById('gfw-cfg-msg');
+            try {
+                const d = await (await fetch(`${API}/gfw/config/reset`, {
+                    method: 'POST', headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({keys: []})
+                })).json();
+                if (d.detail) { msg.innerHTML = '<span style="color:#dc2626;">恢复失败: ' + escHtml(d.detail) + '</span>'; return; }
+                _gfwCfgItems = d.items || [];
+                gfwCfgRenderForm();
+                msg.innerHTML = '<span style="color:#16a34a;">✅ 已恢复默认（当前值来自环境变量 / app.yaml）。</span>';
+            } catch (e) {
+                msg.innerHTML = '<span style="color:#dc2626;">恢复失败: ' + escHtml(e.message) + '</span>';
+            }
+        }
+
+        let _gfwProbeScript = '';
+        async function gfwCfgLoadProbeScript() {
+            try {
+                const d = await (await fetch(`${API}/gfw/config/probe-script`)).json();
+                if (d.detail) { showToast('获取失败: ' + d.detail, 'error'); return; }
+                _gfwProbeScript = d.content || '';
+                document.getElementById('gfw-cfg-script-text').value = _gfwProbeScript;
+                document.getElementById('gfw-cfg-usage').textContent = (d.usage || []).join('\n');
+                document.getElementById('gfw-cfg-script').style.display = 'block';
+            } catch (e) { showToast('获取失败: ' + e.message, 'error'); }
+        }
+        function gfwCfgCopyProbeScript() {
+            if (!_gfwProbeScript) { gfwCfgLoadProbeScript(); return; }
+            const ta = document.createElement('textarea');
+            ta.value = _gfwProbeScript;
+            document.body.appendChild(ta); ta.select();
+            try { document.execCommand('copy'); showToast('✅ 脚本已复制'); } catch(e) { showToast('复制失败，请手动选择', 'error'); }
+            document.body.removeChild(ta);
+        }
+        function gfwCfgDownloadProbeScript() {
+            if (!_gfwProbeScript) { gfwCfgLoadProbeScript(); return; }
+            const blob = new Blob([_gfwProbeScript], {type: 'text/x-python'});
+            const a = document.createElement('a'); a.href = URL.createObjectURL(blob);
+            a.download = 'cn_probe.py'; a.click(); URL.revokeObjectURL(a.href);
+            showToast('✅ 已下载 cn_probe.py');
         }
 
         const CONVERT_FORMATS = [
