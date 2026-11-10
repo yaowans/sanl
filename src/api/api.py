@@ -999,6 +999,8 @@ async def list_nodes(
             "last_checked_at": n.last_checked_at, "fail_count": getattr(n, "fail_count", 0),
             "stream_flags": getattr(n, "stream_flags", None),  # 流媒体解锁标记（Netflix/Disney/YouTube 等）
             "favorite": getattr(n, "favorite", 0),
+            "source_name": getattr(n, "source_name", None),   # 来源数据源名称
+            "src_type": getattr(n, "src_type", None),          # 来源类型（github/http/manual/...）
             "manual": n.id in manual_ids,  # 手动导入节点（一键清理时默认跳过）
         }
         d.update(repository.score_grade(n.score or 0))

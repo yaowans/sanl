@@ -604,7 +604,7 @@
             panel.id = 'nf-cols-panel';
             panel.style.cssText = 'position:fixed;z-index:1500;display:none;background:var(--surface);border:1px solid var(--border);border-radius:10px;box-shadow:var(--shadow-lg);padding:10px 14px;flex-direction:column;gap:6px;min-width:130px;';
             panel.innerHTML = [
-                ['id','编号列'],['name','名称列'],['country','国家/地区列'],['ip','服务器 IP 列'],
+                ['id','编号列'],['name','名称列'],['source','来源列'],['country','国家/地区列'],['ip','服务器 IP 列'],
                 ['latency','延迟列'],['speed','速度列'],
                 ['score','评分列'],['grade','等级列'],['status','状态列']
             ].map(([v,t]) => `<label style="display:flex;align-items:center;gap:8px;font-size:13px;cursor:pointer;"><input type="checkbox" value="${v}" class="nf-col-cb"> ${t}</label>`).join('');
@@ -924,7 +924,7 @@
             if (!tbody) return;
             const cols = [
                 ['sel','',''], ['star','',''], ['id','编号'], ['name','名称'], ['type','协议'],
-                ['country','国家/地区'], ['ip','服务器 IP'], ['latency','延迟'], ['speed','速度'],
+                ['source','来源'], ['country','国家/地区'], ['ip','服务器 IP'], ['latency','延迟'], ['speed','速度'],
                 ['score','评分'], ['grade','等级'], ['status','状态'],
                 ['stream','解锁',''], ['trend','📈',''], ['ban','🚫',''], ['rename','✏️',''], ['del','🗑','']
             ].filter(c => !colVis.includes(c[0]));
@@ -948,6 +948,8 @@
                     id: `<td style="font-family:ui-monospace,monospace;font-size:12px;color:var(--text-muted);">${n.id}</td>`,
                     name: `<td style="max-width:180px;overflow:hidden;text-overflow:ellipsis;" title="${escHtml(n.node_name||'')}">${n.manual?'<span class="badge badge-info" style="margin-right:4px;" title="手动导入节点（一键清理时不会被删除）">🛠</span>':''}${escHtml(n.node_name||'-')}</td>`,
                     type: `<td><span class="badge badge-info">${(n.node_type||'').toUpperCase()}</span></td>`,
+                    source: `<td style="max-width:130px;overflow:hidden;text-overflow:ellipsis;font-size:12px;"
+                              title="${escHtml(n.source_name||'无源归属（测速回填）')}">${n.source_name ? escHtml(n.source_name) : '<span style="color:#94a3b8;">测速回填</span>'}</td>`,
                     country: `<td>${countryCell(n)}</td>`,
                     ip: `<td style="font-family:ui-monospace,monospace;font-size:12px;max-width:160px;overflow:hidden;text-overflow:ellipsis;"
                            title="${escHtml((n.server||'')+(n.port?':'+n.port:''))}">${escHtml(n.server||'-')}${n.port?':'+n.port:''}</td>`,

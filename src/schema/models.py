@@ -61,6 +61,9 @@ class Node:
     last_seen_at: Optional[int] = None
     favorite: int = 0
     city: Optional[str] = None  # GeoIP 城市信息
+    # 来源信息（list_nodes JOIN sources 带出的展示字段，非 DB 列）
+    source_name: Optional[str] = None
+    src_type: Optional[str] = None
 
 
 @dataclass

@@ -899,7 +899,9 @@ def list_nodes(status: Optional[str] = None, country: Optional[str] = None, node
                offset: int = 0, source_type: Optional[str] = None,
                category: Optional[str] = None, country_code: Optional[str] = None) -> List[Node]:
     with get_connection() as conn:
-        query = "SELECT n.* FROM nodes n LEFT JOIN sources s ON n.source_id = s.id WHERE 1=1"
+        # 附带来源名称（节点列表"来源"列展示用）；Node(**d) 不认识的多余键在 api 层取用
+        query = ("SELECT n.*, s.name AS source_name, s.source_type AS src_type "
+                 "FROM nodes n LEFT JOIN sources s ON n.source_id = s.id WHERE 1=1")
         params = []
         if category:
             query += " AND s.category = ?"
