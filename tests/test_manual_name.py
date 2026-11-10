@@ -126,4 +126,32 @@ print("  名称:", nm)
 assert nm == "🇺🇸US_1|one.one.one.one", nm   # 域名原样，不解析
 print("  ✓ 域名原样呈现（CNAME/分线路域名不受境外 DNS 视角影响）")
 
+# ---------- 7. 抓取回填不降级规范化名（用户报告的核心 bug）----------
+print("\n=== 7. 抓取回填保留规范化名 ===")
+# h2 已有规范化名（auto_name 戳）。模拟下一轮抓取带上游裸名入库：
+repository.upsert_nodes_bulk([{
+    "subscribe_url": "manual://x", "source_id": h2.source_id,
+    "node_name": "上游裸名-US节点", "node_type": "ss",
+    "node_data": {"server": "one.one.one.one", "port": 443,
+                  "password": "p", "cipher": "aes-128-gcm"},
+}])
+with repository.get_connection() as conn:
+    nm = conn.execute("SELECT node_name FROM nodes WHERE id=?", (h2.id,)).fetchone()[0]
+print("  抓取后名称:", nm)
+assert nm == "🇺🇸US_1|one.one.one.one", f"规范化名被上游裸名降级: {nm}"
+print("  ✓ 抓取回填不再把规范化名冲回上游裸名")
+
+# 测速回填同样不降级
+repository.apply_check_results([{
+    "node_type": "ss", "node_data": {"server": "one.one.one.one", "port": 443,
+                                     "password": "p", "cipher": "aes-128-gcm"},
+    "node_name": "subs-check-改名|980KB/s", "latency": 60, "download_speed": 1003520,
+}])
+with repository.get_connection() as conn:
+    row = conn.execute("SELECT node_name, latency, download_speed FROM nodes WHERE id=?", (h2.id,)).fetchone()
+print("  测速回填后:", row["node_name"], "lat =", row["latency"], "speed =", row["download_speed"])
+assert row["node_name"] == "🇺🇸US_1|one.one.one.one", row["node_name"]
+assert row["latency"] == 60 and row["download_speed"] == 1003520   # 指标照常更新
+print("  ✓ 测速指标已更新、名字保留规范化格式（随后由全池 normalize 重建）")
+
 print("\n=== 全部断言通过 ===")

@@ -278,6 +278,17 @@ class Checker:
                 from ..schema.repository import update_node_scores
                 scored = update_node_scores()
                 logger.info(f"Updated scores for {scored} nodes")
+                # 全池规范化命名：{旗}{CC}_{i}|{服务器}|{延迟}ms|{速度}
+                # 测速指标刚回填，此时重建名字才能带上最新的服务器地址与速度段
+                # （自定义名不动；否则抓取回填的上游裸名会一直留在列表里）
+                try:
+                    from ..manual_check import normalize_manual_names
+                    all_nodes = repository.list_nodes(limit=20000)
+                    renamed = normalize_manual_names(all_nodes)
+                    if renamed:
+                        logger.info(f"Normalized names for {renamed} nodes")
+                except Exception as ne:
+                    logger.warning(f"name normalize failed: {ne}")
                 repository.update_check_job(job_id.id, "completed", result=json.dumps(result))
                 job.update({"status": "completed", "finished_at": time.time()})
                 task_manager.finish(TASK_ID)

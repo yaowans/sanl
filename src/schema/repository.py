@@ -230,8 +230,8 @@ def upsert_nodes_bulk(items: List[dict]) -> dict:
         before = conn.execute("SELECT COUNT(*) FROM nodes").fetchone()[0]
         # 用户手动删除过的节点不再入库（下轮抓取否则会复活它）
         tombstoned = _tombstoned_fingerprints(conn)
-        # 用户自定义名（重命名）优先于上游名称——防止抓取回填时被覆盖
-        custom_names = _custom_names(conn)
+        # 本地命名标记优先于上游名称：用户自定义名 > 系统规范化名 > 上游裸名
+        local = _local_names(conn)
         skipped = 0
         for it in items:
             fp = node_fingerprint(it["node_type"], it["node_data"])
@@ -239,13 +239,17 @@ def upsert_nodes_bulk(items: List[dict]) -> dict:
                 skipped += 1
                 continue
             upstream_name = it["node_name"]
-            keep = custom_names.get(fp)
-            node_name = keep if keep else upstream_name
-            # ⚠ node_data 会被上游配置整体覆盖，custom_name 必须一起带过去，
-            # 否则本轮就把用户的自定义名抹掉了
+            mark = local.get(fp)
             data = dict(it["node_data"])
-            if keep:
-                data["custom_name"] = keep
+            if mark and mark.get("custom_name"):
+                node_name = mark["custom_name"]
+                data["custom_name"] = mark["custom_name"]
+            elif mark and mark.get("auto_name"):
+                # 系统规范化名（含服务器地址+速度段）不被上游裸名降级
+                node_name = mark["node_name"]
+                data["auto_name"] = mark["auto_name"]
+            else:
+                node_name = upstream_name
             conn.execute(
                 """INSERT INTO nodes (subscribe_url, source_id, node_name, node_type,
                                       node_data, status, fingerprint, last_seen_at)
@@ -347,20 +351,25 @@ def apply_check_results(results: List[dict], scope_fingerprints: Optional[set] =
     with get_connection() as conn:
         # 用户手动删除过的节点不复活
         tombstoned = _tombstoned_fingerprints(conn)
-        # 用户自定义名优先于测速引擎返回的名称
-        custom_names = _custom_names(conn)
+        # 本地命名标记优先：用户自定义名 > 系统规范化名 > 测速引擎名
+        local = _local_names(conn)
         for r in results:
             fp = node_fingerprint(r["node_type"], r["node_data"])
             if fp in tombstoned:
                 continue
             upstream_name = r.get("node_name", "")
-            keep = custom_names.get(fp)
-            node_name = keep if keep else upstream_name
-            # ⚠ node_data 会被测速结果整体覆盖，custom_name 必须一起带过去，
-            # 否则本轮就把用户的自定义名抹掉了（下一轮就找不到它）
+            mark = local.get(fp)
             data = dict(r["node_data"])
-            if keep:
-                data["custom_name"] = keep
+            if mark and mark.get("custom_name"):
+                node_name = mark["custom_name"]
+                data["custom_name"] = mark["custom_name"]
+            elif mark and mark.get("auto_name"):
+                # 保留系统规范化名（含服务器地址段）；测速新指标在
+                # data 中已更新，规范化名随后由全池 normalize 重建
+                node_name = mark["node_name"]
+                data["auto_name"] = mark["auto_name"]
+            else:
+                node_name = upstream_name
             conn.execute(
                 """INSERT INTO nodes (subscribe_url, source_id, node_name, node_type, node_data,
                                       status, fingerprint, download_speed, latency, country,
@@ -1721,6 +1730,30 @@ def _custom_names(conn) -> Dict[str, str]:
         cn = d.get("custom_name")
         if cn:
             out[r["fingerprint"]] = str(cn)
+    return out
+
+
+def _local_names(conn) -> Dict[str, dict]:
+    """本地命名标记 {fingerprint: {custom_name, auto_name, node_name}}。
+
+    写入路径（抓取 upsert / 测速回填）据此决定节点名：
+    - custom_name：用户手动命名，任何覆盖都让位
+    - auto_name：系统规范化名（{旗}{CC}_{i}|{服务器}|{延迟}ms|{速度}），
+      **不被上游裸名降级**——否则每次抓取都会把好名字冲回上游原始名
+      （用户报告"抓取后节点名没有服务器地址+速度"的根因）
+    """
+    out: Dict[str, dict] = {}
+    rows = conn.execute(
+        "SELECT fingerprint, node_name, node_data FROM nodes WHERE fingerprint IS NOT NULL").fetchall()
+    for r in rows:
+        d = _parse_node_data(r["node_data"])
+        cn, an = d.get("custom_name"), d.get("auto_name")
+        if cn or an:
+            out[r["fingerprint"]] = {
+                "custom_name": cn,
+                "auto_name": an,
+                "node_name": r["node_name"],
+            }
     return out
 
 
