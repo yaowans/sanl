@@ -20,7 +20,7 @@ cfg_mod._config = {
 from src.schema import repository
 repository.init_db()
 
-# 场景：源 A 解析 10 个节点，其中 3 个与源 B 重复（指纹相同，归属被 B 抢走）
+# 场景：源 A 解析 10 个节点，其中 3 个与源 B 重复（指纹相同）
 a = repository.add_source("源A", "https://a.example/sub", "github")
 b = repository.add_source("源B", "https://b.example/sub", "github")
 
@@ -31,7 +31,7 @@ def nd(i):
 repository.upsert_nodes_bulk([{
     "subscribe_url": a.url, "source_id": a.id, "node_name": f"A-{i}",
     "node_type": "ss", "node_data": nd(i)} for i in range(10)])
-# B 导入其中 3 个相同指纹（10,11,12 → 0,1,2 冲突）+ 5 个自己的
+# B 导入其中 3 个相同指纹（0,1,2 冲突）+ 5 个自己的
 repository.upsert_nodes_bulk(
     [{"subscribe_url": b.url, "source_id": b.id, "node_name": f"B-dup-{i}",
       "node_type": "ss", "node_data": nd(i)} for i in range(3)] +
@@ -41,18 +41,19 @@ repository.upsert_nodes_bulk(
 repository.update_source_status(a.id, 1, 10)   # A 声称解析 10 个
 repository.update_source_status(b.id, 1, 8)    # B 声称解析 8 个
 
-# ---------- 1. 实际归属 vs 声称解析数 ----------
-print("=== 1. 实际归属 vs 上次解析数 ===")
+# ---------- 1. 归属保留原源（后导入者不抢） ----------
+print("=== 1. 归属保留原源 ===")
 counts = repository.count_nodes_by_source()
 with repository.get_connection() as conn:
     a_actual = conn.execute("SELECT COUNT(*) FROM nodes WHERE source_id=?", (a.id,)).fetchone()[0]
     b_actual = conn.execute("SELECT COUNT(*) FROM nodes WHERE source_id=?", (b.id,)).fetchone()[0]
 print(f"  A: 声称 10，实际 {a_actual}；B: 声称 8，实际 {b_actual}")
-# 指纹去重后 A 10 个、B 5 个（B 的 3 个 dup 因后导入，指纹冲突时 ON CONFLICT
-# 会把 source_id 改成 B → 实际分布取决于导入顺序；关键是两数之和 == 总数）
+# A 先导入 → 10 个全归 A；B 只拥有自己的 5 个新节点
+assert a_actual == 10, (a_actual, b_actual)
+assert b_actual == 5, (a_actual, b_actual)
 total = repository.count_nodes()
-assert a_actual + b_actual == total, (a_actual, b_actual, total)
-print(f"  ✓ 实际归属之和 {a_actual + b_actual} == 总节点 {total}")
+assert a_actual + b_actual == total == 15, (a_actual, b_actual, total)
+print("  ✓ A 保留全部 10 个归属，B 的重复导入不抢（后导入者不覆盖）")
 
 # ---------- 2. count_nodes_by_source 返回值与库一致 ----------
 print("\n=== 2. count_nodes_by_source 口径 ===")
@@ -74,11 +75,17 @@ async def _health():
     return resp
 
 health = asyncio.run(_health())
-hmap = {h["id"]: h for h in health}
+# 新返回结构：{total_sources, actual_total, orphan_nodes, pool_total, items}
+assert "items" in health and "actual_total" in health, list(health.keys())
+hmap = {h["id"]: h for h in health["items"]}
 assert hmap[a.id]["actual_nodes"] == a_actual, hmap[a.id]
 assert hmap[b.id]["actual_nodes"] == b_actual, hmap[b.id]
 assert hmap[a.id]["node_count"] == 10   # 上次解析数保留原语义
 print(f"  ✓ actual_nodes(A)={hmap[a.id]['actual_nodes']} node_count(A)={hmap[a.id]['node_count']}")
+# 汇总字段守恒
+assert health["actual_total"] == a_actual + b_actual
+assert health["pool_total"] == health["actual_total"] + health["orphan_nodes"]
+print(f"  ✓ actual_total={health['actual_total']} + orphan={health['orphan_nodes']} == pool_total={health['pool_total']}")
 
 # ---------- 4. 孤立节点计数 ----------
 print("\n=== 4. 孤立节点 ===")

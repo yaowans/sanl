@@ -1854,7 +1854,13 @@ async def get_sources_health():
             "state": state,
             "healthy": state == "healthy"
         })
-    return health
+    return {
+        "total_sources": len(health),
+        "actual_total": sum(actual_counts.values()),   # 各源实际归属之和
+        "orphan_nodes": orphan,                        # 无源归属（测速回填）
+        "pool_total": sum(actual_counts.values()) + orphan,
+        "items": health,
+    }
 
 
 @api_router.get("/tasks")

@@ -1657,23 +1657,22 @@
                 const tbodyEl = document.getElementById('sources-tbody');
                 if (!healthEl || !tbodyEl) return;  // 页面已切换，放弃本次渲染（修复跨页 null 崩溃）
                 _srcAll = Array.isArray(sources) ? sources : [];
-                _srcHealth = Array.isArray(health) ? health : [];
+                // /sources/health 现返回 {total_sources, actual_total, orphan_nodes, pool_total, items}
+                const hobj = (health && !Array.isArray(health) && health.items) ? health : { items: health || [] };
+                _srcHealth = Array.isArray(hobj.items) ? hobj.items : [];
 
                 const healthy = _srcHealth.filter(h => h.state === 'healthy').length;
                 const unhealthy = _srcHealth.filter(h => h.state === 'unhealthy').length;
-                // 累计节点 = 各源当前实际关联节点数之和 + 无源归属（测速回填）节点
-                // ⚠ 不能用 nodes/stats.total 之外的口径混搭，也不能用 sources.node_count
-                //   （那是"上次抓取解析数"，与库内归属对不上，用户看到的数字会互相矛盾）
-                const actualSum = _srcHealth.reduce((a, h) => a + (h.actual_nodes || 0), 0);
-                const orphan = _srcHealth.length ? (stats && stats.pool_total
-                    ? Math.max(0, stats.pool_total - actualSum) : 0) : 0;
-                const nodeCount = actualSum;
+                // 累计节点 = 各源实际归属之和（后端算好）+ 孤立节点（后端算好）
+                // 与节点列表总数(pool_total)严格守恒：actual_total + orphan_nodes == pool_total
+                const nodeCount = hobj.actual_total ?? _srcHealth.reduce((a, h) => a + (h.actual_nodes || 0), 0);
+                const orphan = hobj.orphan_nodes ?? 0;
                 healthEl.innerHTML = `
                     <div class="stat-card"><div class="stat-value">${_srcAll.length}</div><div class="stat-label">数据源总数</div></div>
                     <div class="stat-card"><div class="stat-value" style="color:#16a34a;">${healthy}</div><div class="stat-label">健康源</div></div>
                     <div class="stat-card"><div class="stat-value" style="color:#dc2626;">${unhealthy}</div><div class="stat-label">异常源</div></div>
-                    <div class="stat-card"><div class="stat-value" style="color:#2563eb;">${nodeCount}</div>
-                        <div class="stat-label">累计节点${orphan > 0 ? `（另有 ${orphan} 个测速回填）` : ''}</div></div>
+                    <div class="stat-card"><div class="stat-value" style="color:#2563eb;">${nodeCount + orphan}</div>
+                        <div class="stat-label">累计节点${orphan > 0 ? `（源归属 ${nodeCount} + 测速回填 ${orphan}）` : ''}</div></div>
                 `;
                 renderSourcesTable();
             } catch(e) { console.error(e); showToast('数据源加载失败: ' + (e.message||'网络错误'), 'error'); }
@@ -1721,11 +1720,16 @@
                 // 节点数显示库内真实归属（h.actual_nodes），title 里附"上次解析数"备查
                 const h = healthMap.get(s.id);
                 const actualN = h ? (h.actual_nodes ?? s.node_count ?? 0) : (s.node_count || 0);
+                // 归属被其它源抢空的提示：声称解析过但实际归属 0 → 节点内容与其它源重复
+                const stolen = actualN === 0 && (s.node_count || 0) > 0;
+                const nodeCell = stolen
+                    ? `0 <span class="badge badge-secondary" title="该源解析的节点与其它源重复，归属已被先入库的源拥有">已被重复源覆盖</span>`
+                    : actualN;
                 return `<tr><td><input type="checkbox" class="src-cb" data-id="${s.id}"${checked} onchange="toggleSourceSelect(${s.id}, this.checked)"></td>
                     <td>${escHtml(s.name || '')}${disabledTag}</td>
                     <td style="max-width:280px;overflow:hidden;text-overflow:ellipsis;font-size:12px;" title="${escHtml(s.url||'')}">${escHtml(s.url||'')}</td>
                     <td><span class="badge badge-info">${escHtml(s.source_type||'')}</span></td>
-                    <td title="库内实际归属 ${actualN} 个；上次抓取解析 ${s.node_count||0} 个">${actualN}</td>
+                    <td title="库内实际归属 ${actualN} 个；上次抓取解析 ${s.node_count||0} 个">${nodeCell}</td>
                     <td>${badge}</td>
                     <td>
                         <button class="btn btn-sm ${stest ? 'btn-primary' : 'btn-secondary'}" onclick="toggleSpeedTest(${s.id},${stest?0:1})"

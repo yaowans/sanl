@@ -251,8 +251,10 @@ def upsert_nodes_bulk(items: List[dict]) -> dict:
                                       node_data, status, fingerprint, last_seen_at)
                    VALUES (?, ?, ?, ?, ?, 'unknown', ?, ?)
                    ON CONFLICT(fingerprint) DO UPDATE SET
-                       source_id   = excluded.source_id,
-                       subscribe_url = excluded.subscribe_url,
+                       -- 归属保留原源：同一节点多源重复导入时，后导入者不抢归属。
+                       -- 否则先建的源 node_count 声称有节点、实际归属 0（实测踩过）
+                       source_id   = COALESCE(nodes.source_id, excluded.source_id),
+                       subscribe_url = COALESCE(nodes.subscribe_url, excluded.subscribe_url),
                        node_name   = CASE WHEN excluded.node_name != '' THEN excluded.node_name ELSE nodes.node_name END,
                        node_data   = excluded.node_data,
                        last_seen_at = excluded.last_seen_at""",

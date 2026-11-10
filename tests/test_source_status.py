@@ -79,9 +79,10 @@ import asyncio, json
 async def _health_map():
     invalidate_all()   # 清 5s TTL 缓存，读到最新库态
     resp = await get_sources_health()
-    # @cached 装饰器返回 JSONResponse；解出 body
-    if hasattr(resp, "body"):
-        return {h["id"]: h["state"] for h in json.loads(resp.body)}
+    # @cached 装饰器返回 JSONResponse；解出 body（新结构 {items:[...]}）
+    body = json.loads(resp.body) if hasattr(resp, "body") else resp
+    items = body["items"] if isinstance(body, dict) and "items" in body else body
+    return {h["id"]: h["state"] for h in items}
     return {h["id"]: h["state"] for h in resp}
 
 hmap = asyncio.run(_health_map())
