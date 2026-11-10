@@ -31,6 +31,13 @@ def get_config():
     return load_config()
 
 
+def reload_config():
+    """清除配置缓存（yaml 写回后调用，否则运行时读到旧值）"""
+    global _config
+    _config = None
+    return load_config()
+
+
 def get_app_config():
     return load_config().get("app", {})
 

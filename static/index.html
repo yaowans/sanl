@@ -2017,6 +2017,24 @@
                         <span class="text-muted" style="font-size:12px;" id="ck-threshold-hint"></span>
                     </div>
                 </div>
+                <div class="chart-container" style="margin-bottom:16px;">
+                    <h3 style="margin-bottom:12px;">⏰ 定时调度</h3>
+                    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:14px;">
+                        <div>
+                            <div style="font-size:13px;font-weight:600;margin-bottom:6px;">📥 抓取源 <span class="text-muted" style="font-weight:400;" id="ck-next-fetch"></span></div>
+                            <input class="form-input" id="ck-fetch-cron" style="width:100%;font-family:monospace;" placeholder="0 7,14,18 * * *">
+                        </div>
+                        <div>
+                            <div style="font-size:13px;font-weight:600;margin-bottom:6px;">⚡ 测速 <span class="text-muted" style="font-weight:400;" id="ck-next-check"></span></div>
+                            <input class="form-input" id="ck-check-cron" style="width:100%;font-family:monospace;" placeholder="0 7,14,18 * * *">
+                        </div>
+                    </div>
+                    <div class="flex" style="align-items:center;gap:10px;margin-top:12px;flex-wrap:wrap;">
+                        <button class="btn btn-primary btn-sm" onclick="saveSchedule(this)">💾 保存并立即生效</button>
+                        <span class="text-muted" style="font-size:12px;" id="ck-schedule-hint"></span>
+                    </div>
+                    <p class="text-muted" style="font-size:11px;margin-top:8px;" id="ck-schedule-examples"></p>
+                </div>
                 <div id="ck-progress"></div>
                 <div class="page-header" style="margin-top:28px;"><h2 style="font-size:20px;font-weight:700;">📜 任务历史</h2></div>
                 <div class="table-container"><table><thead><tr>
@@ -2024,6 +2042,7 @@
                 </tr></thead><tbody id="check-tbody"></tbody></table></div>
             `;
             loadThreshold();
+            loadSchedule();
             loadCheckHistory();
             pollCheckProgress();   // 启动进度轮询
             pickMode(ckMode);      // 恢复上次选择的测速模式
@@ -2043,6 +2062,35 @@
                     ? `当前手动导入节点 ${total} 个。选「仅手动导入」可单独验证自己的节点是否可用（不消耗公共池测速资源）。`
                     : '当前没有手动导入的节点。可到「来源管理 → 手动导入」添加。';
             } catch(e) { hint.textContent = ''; }
+        }
+
+        async function loadSchedule() {
+            try {
+                const d = await (await fetch(`${API}/settings/schedule`)).json();
+                document.getElementById('ck-fetch-cron').value = d.fetch_cron || '';
+                document.getElementById('ck-check-cron').value = d.check_cron || '';
+                document.getElementById('ck-next-fetch').textContent =
+                    d.next_fetch ? `· 下次 ${d.next_fetch}` : '';
+                document.getElementById('ck-next-check').textContent =
+                    d.next_check ? `· 下次 ${d.next_check}` : '';
+                document.getElementById('ck-schedule-examples').textContent = '格式：' + (d.examples || '');
+            } catch(e) {}
+        }
+        async function saveSchedule(btn) {
+            const fc = document.getElementById('ck-fetch-cron').value.trim();
+            const cc = document.getElementById('ck-check-cron').value.trim();
+            if (!fc && !cc) { showToast('请填写至少一个 cron 表达式', 'error'); return; }
+            btn.disabled = true; btn.textContent = '⏳ 保存中…';
+            try {
+                const qs = new URLSearchParams();
+                if (fc) qs.set('fetch_cron', fc);
+                if (cc) qs.set('check_cron', cc);
+                const d = await (await fetch(`${API}/settings/schedule?${qs}`, { method:'POST' })).json();
+                if (d.detail) { showToast('保存失败: ' + d.detail, 'error'); return; }
+                showToast('✅ 调度已更新并立即生效', 'success');
+                loadSchedule();
+            } catch(e) { showToast('保存失败: ' + (e.message||'网络错误'), 'error'); }
+            btn.disabled = false; btn.textContent = '💾 保存并立即生效';
         }
 
         async function loadThreshold() {

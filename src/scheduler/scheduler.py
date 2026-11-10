@@ -74,7 +74,7 @@ class Scheduler:
         """解析 cron 表达式为 APScheduler 参数（北京时间）"""
         parts = cron_str.strip().split()
         if len(parts) != 5:
-            return {}
+            raise ValueError(f"cron 表达式必须为 5 段: {cron_str!r}")
         minute, hour, day, month, weekday = parts
         return {
             "minute": minute,
@@ -84,6 +84,29 @@ class Scheduler:
             "day_of_week": weekday,
             "timezone": self.TZ,
         }
+
+    def reschedule(self, fetch_cron: str = None, check_cron: str = None):
+        """运行时更新定时任务（无需重启容器）。非法表达式抛 ValueError。"""
+        if fetch_cron:
+            self.sched.reschedule_job(
+                "fetch_sources", trigger=CronTrigger(**self._parse_cron(fetch_cron)))
+            logger.info(f"fetch_sources rescheduled: {fetch_cron}")
+        if check_cron:
+            self.sched.reschedule_job(
+                "run_check", trigger=CronTrigger(**self._parse_cron(check_cron)))
+            logger.info(f"run_check rescheduled: {check_cron}")
+
+    def next_run_times(self) -> dict:
+        """下次运行时间（前端展示用）；调度器未启动返回空"""
+        out = {}
+        try:
+            for job_id, key in (("fetch_sources", "next_fetch"), ("run_check", "next_check")):
+                job = self.sched.get_job(job_id)
+                if job and job.next_run_time:
+                    out[key] = job.next_run_time.strftime("%Y-%m-%d %H:%M:%S")
+        except Exception:
+            pass
+        return out
 
     async def _fetch_sources(self):
         """抓取数据源：遍历 DB 启用源 → 抓取+解析+节点入库（指纹去重）→ 记录健康度"""

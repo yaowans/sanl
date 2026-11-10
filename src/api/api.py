@@ -1219,6 +1219,86 @@ async def apply_qualified_latency():
     changed = repository.apply_qualified_latency(threshold)
     return {"status": "ok", "threshold_ms": threshold, "marked_inactive": changed}
 
+
+# ===== 定时调度配置（抓取/测速 cron 可视化配置）=====
+
+_CRON_EXAMPLES = "5 段 cron（北京时间）：0 7,14,18 * * * = 每天 7/14/18 点 · 0 */6 * * * = 每 6 小时 · */30 * * * * = 每 30 分钟"
+
+
+@api_router.get("/settings/schedule")
+async def get_schedule():
+    """获取抓取/测速定时配置与下次运行时间"""
+    cfg = get_scheduler_config()
+    out = {
+        "status": "ok",
+        "fetch_cron": cfg.get("fetch_cron", "0 7,14,18 * * *"),
+        "check_cron": cfg.get("check_cron", "0 7,14,18 * * *"),
+        "examples": _CRON_EXAMPLES,
+    }
+    if scheduler:
+        out.update(scheduler.next_run_times())
+    return out
+
+
+@api_router.post("/settings/schedule")
+async def set_schedule(request: Request,
+                       fetch_cron: str = Query(None, description="抓取定时 cron（不传则不修改）"),
+                       check_cron: str = Query(None, description="测速定时 cron（不传则不修改）")):
+    """设置抓取/测速定时（写 yaml 并立即重排调度，无需重启容器）"""
+    from apscheduler.triggers.cron import CronTrigger
+    from ..scheduler.scheduler import Scheduler
+
+    if not fetch_cron and not check_cron:
+        raise HTTPException(status_code=400, detail="fetch_cron / check_cron 至少传一个")
+
+    # 先校验表达式（CronTrigger 构造失败即非法）
+    for name, expr in (("fetch_cron", fetch_cron), ("check_cron", check_cron)):
+        if not expr:
+            continue
+        try:
+            CronTrigger(**Scheduler._parse_cron(Scheduler, expr))
+        except Exception as e:
+            raise HTTPException(status_code=400,
+                                detail=f"{name} 表达式非法: {expr}（{_CRON_EXAMPLES}）[{e}]")
+
+    import yaml as _yaml
+    from ..config import _CONFIG_PATH
+    path = _CONFIG_PATH   # 与 load_config 同源（测试/自定义路径下才不会写偏）
+    try:
+        with open(path) as f:
+            cfg = _yaml.safe_load(f) or {}
+        sched_cfg = cfg.setdefault("scheduler", {})
+        if fetch_cron:
+            sched_cfg["fetch_cron"] = fetch_cron.strip()
+        if check_cron:
+            sched_cfg["check_cron"] = check_cron.strip()
+        with open(path, "w") as f:
+            _yaml.dump(cfg, f, default_flow_style=False, allow_unicode=True)
+        from ..config import reload_config
+        reload_config()   # 清缓存（否则运行时读到旧值）
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"保存配置失败: {e}")
+
+    # 立即重排调度任务（容器运行中生效，无需重启）
+    rescheduled = False
+    if scheduler:
+        try:
+            scheduler.reschedule(
+                fetch_cron=fetch_cron, check_cron=check_cron)
+            rescheduled = True
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"重排调度失败（配置已保存）: {e}")
+
+    out = {"status": "ok", "rescheduled": rescheduled,
+           "fetch_cron": get_scheduler_config().get("fetch_cron", ""),
+           "check_cron": get_scheduler_config().get("check_cron", ""),
+           "examples": _CRON_EXAMPLES}
+    if scheduler:
+        out.update(scheduler.next_run_times())
+    return out
+
 # ===== 订阅短链路由 /sub/{token}/{format}（方案核心 API 设计）=====
 
 @sub_router.get("/{token}/{fmt}")
