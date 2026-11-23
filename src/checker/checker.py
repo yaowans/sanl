@@ -336,6 +336,51 @@ class Checker:
             job.update({"status": "failed", "finished_at": time.time(), "error": str(e)})
             return {"status": "error", "job_id": job_id, "error": str(e)}
 
+    async def _apply_tcp_latency(self, results: List[dict]) -> int:
+        """对存活节点做真实 TCP 握手延迟测量并回填 nodes.latency。
+
+        subs-check 只输出速度不输出延迟，旧代码用速度反推 → 快节点恒 50ms。
+        这里按 server:port 并发握手取 RTT（诚实值：TCP 握手延迟）。
+        """
+        from ..utils.tcplatency import measure_tcp_latency
+        from ..schema.repository import update_node_latencies, _parse_node_data
+
+        # 存活结果 → 指纹集合，从库里取节点 id（按指纹匹配）
+        from ..schema import repository as _repo
+        fps = {}
+        for r in results:
+            try:
+                fp = _repo.node_fingerprint(r["node_type"], r["node_data"])
+                d = r["node_data"]
+                fps[fp] = (str(d.get("server") or ""), int(d.get("port") or 0))
+            except Exception:
+                continue
+        if not fps:
+            return 0
+
+        ids = []
+        with _repo.get_connection() as conn:
+            fps_list = list(fps.keys())
+            for i in range(0, len(fps_list), 900):
+                chunk = fps_list[i:i + 900]
+                ph = ",".join("?" * len(chunk))
+                rows = conn.execute(
+                    f"SELECT id, fingerprint FROM nodes WHERE fingerprint IN ({ph})", chunk).fetchall()
+                ids.extend(((r["id"], r["fingerprint"]) for r in rows))
+
+        targets = []
+        for nid, fp in ids:
+            server, port = fps.get(fp, ("", 0))
+            if server and port:
+                targets.append((nid, server, port))
+        if not targets:
+            return 0
+
+        lat = await measure_tcp_latency(targets)
+        n = update_node_latencies(lat)
+        logger.info(f"[tcp-latency] {len(targets)} 个节点，写入 {n} 条真实延迟")
+        return n
+
     async def _apply_gfw_filter(self) -> Dict:
         """GFW 境内可达性复核。
 
@@ -764,12 +809,11 @@ class Checker:
                         break
                     if download_speed and latency:
                         break
-            # speed 模式名称不含延迟，从下载速度反推（subs-check 存活节点均为低速延迟）
-            if latency is None and download_speed is not None:
-                latency = max(50, int(2048000 / (download_speed or 256)))
-            # ⚠ latency 仍为 None 时不造假数据（旧代码硬塞 500ms）：
-            #   测活通过但延迟缺失是真实状态（下载失败/超时节点），
-            #   入库 latency=NULL 前端显示 "-"，GFW 复核与订阅过滤不受影响
+            # ⚠ subs-check 输出里**只有速度、没有延迟**（实测确认）。
+            #   旧代码用「速度反推延迟」的假公式 max(50, 2048000/speed)：
+            #   速度一快结果趋近 0，被夹到 50 → 所有快节点延迟恒为 50ms。
+            #   正确做法：这里只留 None，测速回填后由 measure_tcp_latency()
+            #   对存活节点做真实 TCP 握手测量写入（见 _apply_tcp_latency）。
 
             node_data = dict(proxy)  # clash 原字段即内部存储格式
             node_data.pop('name', None)
@@ -792,6 +836,12 @@ class Checker:
         from ..api.cache import invalidate_all
         stats = apply_check_results(results)
         logger.info(f"测速结果回填完成: 存活 {stats['alive']}，未命中转 inactive {stats['marked_inactive']}")
+        # 真实 TCP 延迟测量：subs-check 输出只有速度没有延迟，
+        # 这里对存活节点做一次并发 TCP 握手，写入真实 RTT
+        try:
+            await self._apply_tcp_latency(results)
+        except Exception as le:
+            logger.warning(f"TCP 延迟测量失败: {le}")
         invalidate_all()  # 数据变更后清空读缓存，保证下一批读快照新鲜
         # 将存活/总数/均分并入 result，供趋势接口读取（原只存 total_nodes 导致 trend 全 0）
         try:

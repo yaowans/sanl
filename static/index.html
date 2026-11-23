@@ -965,7 +965,13 @@
                     country: `<td>${countryCell(n)}</td>`,
                     ip: `<td style="font-family:ui-monospace,monospace;font-size:12px;max-width:160px;overflow:hidden;text-overflow:ellipsis;"
                            title="${escHtml((n.server||'')+(n.port?':'+n.port:''))}">${escHtml(n.server||'-')}${n.port?':'+n.port:''}</td>`,
-                    latency: `<td${stale}>${n.latency ? n.latency+'ms' : '-'}</td>`,
+                    latency: `<td${stale}>${n.latency
+                        ? (n.latency + 'ms' + (n.latency_edge
+                            ? ' <span style="font-size:11px;color:#94a3b8;" title="该域名解析到 CDN 边缘节点（如 Cloudflare），此 RTT 只是到边缘的握手延迟，不代表国内访问延迟">CDN</span>'
+                            : (n.latency < 10
+                                ? ' <span style="font-size:11px;color:#f59e0b;" title="跨境节点握手通常 >30ms。此超低延迟多为机房中间设备/透明代理伪响应（SYN 被就近设备接管），不代表真实代理延迟，节点可能实际不可用">⚠</span>'
+                                : '')))
+                        : '-'}</td>`,
                     speed: `<td${stale}>${speed}</td>`,
                     score: `<td${staleColor}>${score.toFixed(1)}</td>`,
                     grade: `<td>${grade}</td>`,

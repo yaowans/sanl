@@ -270,11 +270,9 @@ def _parse_subs_output(path: str) -> List[dict]:
                 if digits.isdigit():
                     latency = int(digits)
                     break
-        if latency is None and download_speed is not None:
-            latency = max(50, int(2048000 / (download_speed or 256)))
-        # ⚠ latency 仍为 None 时**不造假数据**：测活通过但延迟/速度缺失是真实状态
-        #   （如 latency 模式不测速），入库 latency=NULL，前端显示 "-"。
-        #   旧代码硬塞 500ms 假延迟——用户看到清一色 500ms 还以为测速坏了。
+        # ⚠ subs-check 输出里只有速度没有延迟；旧代码用「速度反推延迟」假公式
+        #   max(50, 2048000/speed)，快节点全被夹成 50ms。这里只留 None，
+        #   由 run_manual_check 末尾的真实 TCP 握手测量回填。
         node_data = dict(proxy)
         node_data.pop("name", None)
         results.append({
@@ -445,6 +443,24 @@ async def run_manual_check(node_ids: List[int], *, mode: str = "latency",
     else:
         # 没存活节点 → 作用域内的节点标记 inactive（其他节点不受影响）
         repository.mark_missing_inactive(set(), scope_fingerprints=scope)
+
+    # ---- 4.5 真实 TCP 延迟测量（subs-check 输出无延迟字段）----
+    try:
+        prog("latency", 90, 100, "测量真实 TCP 延迟…")
+        live_ids = {repository.node_fingerprint(r["node_type"], r["node_data"]) for r in results}
+        targets = []
+        for n in repository.get_nodes_by_ids(node_ids):
+            d = n.node_data if isinstance(n.node_data, dict) else {}
+            fp = repository.node_fingerprint(n.node_type, d)
+            if fp in live_ids and d.get("server") and d.get("port"):
+                targets.append((n.id, str(d["server"]), int(d["port"])))
+        if targets:
+            from .utils.tcplatency import measure_tcp_latency
+            lat = await measure_tcp_latency(targets)
+            n_lat = repository.update_node_latencies(lat)
+            logger.info(f"[manual] TCP 延迟测量 {len(targets)} 个，写入 {n_lat}")
+    except Exception as le:
+        logger.warning(f"[manual] TCP 延迟测量失败: {le}")
 
     # ---- 5. 规范化命名（地区补齐后才有意义）----
     prog("rename", 95, 100, "规范化命名…")

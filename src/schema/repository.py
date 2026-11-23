@@ -982,6 +982,45 @@ def update_node_status(node_id: int, status: str, latency: Optional[int] = None,
         )
 
 
+def update_node_latencies(latencies: Dict[int, object]) -> int:
+    """批量写入实测 TCP 延迟。
+
+    latencies: {node_id: {"rtt": int|None, "edge": bool}}
+      rtt=None  → 握手失败，保持原值不动
+      edge=True → 解析到 CDN 边缘，写入 node_data.latency_edge=1（前端标注）
+    兼容旧格式 {node_id: int|None}。
+    """
+    now = int(__import__('time').time())
+    rows = []
+    for k, v in (latencies or {}).items():
+        if isinstance(v, dict):
+            rtt, edge = v.get("rtt"), bool(v.get("edge"))
+        else:
+            rtt, edge = v, False
+        if rtt is None:
+            continue
+        rows.append((int(rtt), int(k), edge))
+    if not rows:
+        return 0
+    with get_connection() as conn:
+        conn.executemany(
+            "UPDATE nodes SET latency = ?, updated_at = ? WHERE id = ?",
+            [(rtt, now, nid) for rtt, nid, _ in rows])
+        # CDN 边缘标记写进 node_data（不额外加列，避免迁移）
+        for rtt, nid, edge in rows:
+            row = conn.execute("SELECT node_data FROM nodes WHERE id = ?", (nid,)).fetchone()
+            if not row:
+                continue
+            data = _parse_node_data(row["node_data"])
+            if edge:
+                data["latency_edge"] = 1
+            elif "latency_edge" in data:
+                data.pop("latency_edge", None)
+            conn.execute("UPDATE nodes SET node_data = ? WHERE id = ?",
+                         (json.dumps(data, ensure_ascii=False), nid))
+    return len(rows)
+
+
 def rename_node(node_id: int, new_name: str) -> bool:
     """节点重命名。
 

@@ -1003,6 +1003,9 @@ async def list_nodes(
             "favorite": getattr(n, "favorite", 0),
             "source_name": getattr(n, "source_name", None),   # 来源数据源名称
             "src_type": getattr(n, "src_type", None),          # 来源类型（github/http/manual/...）
+            # 延迟是否只是"到 CDN 边缘"的 RTT（不代表国内访问延迟）
+            "latency_edge": bool((n.node_data or {}).get("latency_edge")
+                                 if isinstance(n.node_data, dict) else False),
             "manual": n.id in manual_ids,  # 手动导入节点（一键清理时默认跳过）
         }
         d.update(repository.score_grade(n.score or 0))
