@@ -973,14 +973,16 @@ async def list_nodes(
     max_latency: Optional[int] = Query(None, ge=0, description="最大延迟 ms"),
     sort: str = Query("latency", pattern="^(latency|speed|score|created|name|country)$"),
     order: str = Query("asc", pattern="^(asc|desc)$"),
-    source_type: Optional[str] = Query(None, description="manual=手动导入, auto=系统抓取")
+    source_type: Optional[str] = Query(None, description="manual=手动导入, auto=系统抓取"),
+    q: Optional[str] = Query(None, description="全库搜索关键词（节点名 / 服务器地址）")
 ):
     """获取节点列表（筛选/排序/分页，方案 v2.1 Phase 4）"""
     nodes = repository.list_nodes(
         status=status, country=country, country_code=country_code,
         node_type=node_type, limit=limit,
         offset=offset, min_score=min_score, min_speed=min_speed,
-        max_latency=max_latency, sort=sort, order=order, source_type=source_type
+        max_latency=max_latency, sort=sort, order=order, source_type=source_type,
+        keyword=q
     )
     # 手动导入的节点 id 集合（一键清理时默认跳过）
     try:

@@ -908,7 +908,8 @@ def list_nodes(status: Optional[str] = None, country: Optional[str] = None, node
                limit: int = 100, min_score: Optional[float] = None, min_speed: Optional[float] = None,
                max_latency: Optional[int] = None, sort: str = "latency", order: str = "asc",
                offset: int = 0, source_type: Optional[str] = None,
-               category: Optional[str] = None, country_code: Optional[str] = None) -> List[Node]:
+               category: Optional[str] = None, country_code: Optional[str] = None,
+               keyword: Optional[str] = None) -> List[Node]:
     with get_connection() as conn:
         # 附带来源名称（节点列表"来源"列展示用）；Node(**d) 不认识的多余键在 api 层取用
         query = ("SELECT n.*, s.name AS source_name, s.source_type AS src_type "
@@ -928,6 +929,12 @@ def list_nodes(status: Optional[str] = None, country: Optional[str] = None, node
         if country_code:
             query += " AND UPPER(n.country_code) = ?"
             params.append(str(country_code).strip().upper())
+        if keyword:
+            # 全库搜索（节点名 / 服务器地址 / node_data 原始配置）
+            # ⚠ 前端原先是只过滤当前页已加载的 50 条 → 搜不到其它页的节点
+            kw = f"%{keyword.strip()}%"
+            query += " AND (n.node_name LIKE ? OR n.node_data LIKE ?)"
+            params.extend([kw, kw])
         if node_type:
             query += " AND n.node_type = ?"
             params.append(node_type)

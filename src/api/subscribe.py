@@ -30,8 +30,8 @@ def generate_clash(nodes: List[Node]) -> str:
     """生成 Clash 基础版配置（过滤掉 hysteria/hysteria2/tuic 等不支持的协议）"""
     proxies = []
     for n in nodes:
-        # Clash 基础版不支持 hysteria/hysteria2/tuic，跳过
-        if n.node_type in ("hysteria", "hysteria2", "hy2", "tuic"):
+        # Clash 基础版不支持 hysteria/hysteria2/tuic/anytls，跳过
+        if n.node_type in ("hysteria", "hysteria2", "hy2", "tuic", "anytls"):
             continue
         try:
             nd = _nd(n)
@@ -42,6 +42,8 @@ def generate_clash(nodes: List[Node]) -> str:
                 "port": int(nd.get("port", 443)),
             }
             t = p["type"]
+            if not t:
+                continue   # 未知协议（_clash_type 返回空）跳过，不生成字段错乱的假节点
 
             if t in ("ss", "ssr"):
                 p["cipher"] = _cipher_of(nd, "aes-128-gcm")
@@ -106,6 +108,12 @@ def generate_clash(nodes: List[Node]) -> str:
                 if nd.get("dns"): p["dns"] = nd["dns"]
                 if nd.get("mtu"): p["mtu"] = nd["mtu"]
                 p["udp"] = True
+            elif t == "anytls":
+                # Clash.Meta 支持 anytls：password + sni + skip-cert-verify
+                p["password"] = nd.get("password", "")
+                p["udp"] = True
+                if nd.get("sni") or nd.get("servername"):
+                    p["sni"] = nd.get("sni") or nd.get("servername")
 
             _clash_tls(nd, p)
             if n.country:
@@ -445,6 +453,15 @@ def _to_link(n: Node) -> str:
         if nd.get("obfs"): qs["obfs"] = nd["obfs"]
         q = "&".join(f"{k}={v}" for k, v in qs.items() if v)
         return f"snell://{nd.get('password', nd.get('psk',''))}@{server}:{port}" + (f"?{q}" if q else "")
+    if ptype == "anytls":
+        # anytls://password@host:port?sni=...&insecure=1#name（sing-box / mihomo 通用）
+        qs = {}
+        if nd.get("sni") or nd.get("servername"):
+            qs["sni"] = nd.get("sni") or nd.get("servername")
+        if nd.get("skip-cert-verify"): qs["insecure"] = "1"
+        if nd.get("client-fingerprint"): qs["fp"] = nd["client-fingerprint"]
+        q = "&".join(f"{k}={v}" for k, v in qs.items() if v)
+        return f"anytls://{nd.get('password','')}@{server}:{port}" + (f"?{q}" if q else "")
     if ptype == "wireguard":
         qs = {}
         if nd.get("private-key"): qs["privateKey"] = nd["private-key"]
@@ -548,6 +565,14 @@ def generate_singbox(nodes: List[Node]) -> str:
                 }
                 _sbox_tls(nd, ob)
                 outbounds.append(ob)
+            elif ptype == "anytls":
+                # sing-box 1.10+ 原生支持 anytls
+                ob = {
+                    "type": "anytls", "tag": tag, "server": server,
+                    "server_port": port, "password": nd.get("password", ""),
+                }
+                _sbox_tls(nd, ob)
+                outbounds.append(ob)
             elif ptype in ("socks5", "socks"):
                 ob = {"type": "socks", "tag": tag, "server": server, "server_port": port}
                 if nd.get("username"):
@@ -629,7 +654,9 @@ def _clash_type(node_type: str) -> str:
     if t == "http": return "http"
     if t == "snell": return "snell"
     if t == "wireguard": return "wireguard"
-    return "ss"
+    if t == "anytls": return "anytls"
+    # 未知类型返回空串（调用方跳过）——旧代码兜底成 "ss" 会生成字段错乱的假节点
+    return ""
 # ============ Surge / Loon / Quantumult X ============
 
 def generate_surge(nodes: List[Node]) -> str:
@@ -819,6 +846,8 @@ def generate_clash_meta(nodes: List[Node]) -> str:
                 "port": int(nd.get("port", 443)),
             }
             t = p["type"]
+            if not t:
+                continue   # 未知协议（_clash_type 返回空）跳过，不生成字段错乱的假节点
 
             if t in ("ss", "ssr"):
                 p["cipher"] = _cipher_of(nd, "aes-128-gcm")
@@ -876,6 +905,12 @@ def generate_clash_meta(nodes: List[Node]) -> str:
                 if nd.get("dns"): p["dns"] = nd["dns"]
                 if nd.get("mtu"): p["mtu"] = nd["mtu"]
                 p["udp"] = True
+            elif t == "anytls":
+                # Clash.Meta 支持 anytls：password + sni + skip-cert-verify
+                p["password"] = nd.get("password", "")
+                p["udp"] = True
+                if nd.get("sni") or nd.get("servername"):
+                    p["sni"] = nd.get("sni") or nd.get("servername")
 
             _clash_tls(nd, p)
             if n.country:

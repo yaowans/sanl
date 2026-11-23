@@ -482,7 +482,7 @@
                             <option value="asc">升序</option>
                             <option value="desc">降序</option>
                         </select>
-                        <input class="form-input" style="width:200px;" id="nf-search" placeholder="搜索..." oninput="filterNodes()">
+                        <input class="form-input" style="width:200px;" id="nf-search" placeholder="全库搜索名称/IP/域名…" oninput="debouncedSearchNodes()">
                         <label class="text-muted" style="font-size:13px;display:flex;align-items:center;gap:4px;">
                             <input type="checkbox" id="nf-export-latency" checked> 延迟
                         </label>
@@ -535,11 +535,16 @@
             const cc = document.getElementById('nf-country') ? document.getElementById('nf-country').value : '';
             const offset = nodePage * nodePageSize;
             // 真分页：每次只拉当前页（原写死 limit=200 导致永远只显示前 4 页）
-            let url = `${API}/nodes?limit=${nodePageSize}&offset=${offset}&sort=${sort}&order=${order}&_t=${Date.now()}`;
+            // 搜索时一次拉更多（全库命中尽量全显示），普通列表按分页大小
+            const _kwNow = (document.getElementById('nf-search') ? document.getElementById('nf-search').value : '').trim();
+            const _limit = _kwNow ? 500 : nodePageSize;
+            let url = `${API}/nodes?limit=${_limit}&offset=${offset}&sort=${sort}&order=${order}&_t=${Date.now()}`;
             if (status) url += `&status=${status}`;
             if (type) url += `&node_type=${type}`;
             if (src) url += `&source_type=${src}`;
             if (cc) url += `&country_code=${encodeURIComponent(cc)}`;
+            const kw = (document.getElementById('nf-search') ? document.getElementById('nf-search').value : '').trim();
+            if (kw) url += `&q=${encodeURIComponent(kw)}`;
             try {
                 const nodes = await (await fetch(url)).json();
                 allNodes = nodes;
@@ -548,24 +553,31 @@
                 _nodeSelected = new Set(Array.from(_nodeSelected).filter(id => visible.has(id)));
                 updateNodeBatchDelBtn();
                 // 总数用于计算总页数（来自统计接口）
-                try {
-                    const st = await (await fetch(`${API}/nodes/stats`)).json();
-                    nodeTotal = (st && (st.total || st.total_nodes)) || nodes.length;
-                } catch(e) { nodeTotal = nodes.length + offset; }
+                // 搜索时无法用全池总数算页数（会把无关节点算进页数），
+                // 直接把当前返回条数当总数——搜到多少显示多少，翻页无意义
+                const kwNow = (document.getElementById('nf-search') ? document.getElementById('nf-search').value : '').trim();
+                if (kwNow) {
+                    nodeTotal = nodes.length;
+                } else {
+                    try {
+                        const st = await (await fetch(`${API}/nodes/stats`)).json();
+                        nodeTotal = (st && (st.total || st.total_nodes)) || nodes.length;
+                    } catch(e) { nodeTotal = nodes.length + offset; }
+                }
                 const loading = document.getElementById('nodes-loading');
                 if (loading) loading.style.display = 'none';
                 renderNodePage();
             } catch(e) { console.error(e); }
         }
 
-        function filterNodes() {
-            const q = (document.getElementById('nf-search').value || '').toLowerCase();
-            if (!q) { renderNodePage(); return; }
-            const filtered = allNodes.filter(n => (n.node_name||'').toLowerCase().includes(q) || (n.country||'').includes(q));
-            renderNodeTable(filtered);
-            const _pg = document.getElementById('nodes-pagination');
-            if (_pg) _pg.innerHTML = '';
+        // 全库搜索（服务端按关键词过滤 → 能搜到其它分页的节点）
+        // 旧实现只过滤当前页已加载的 50 条，其它页的节点一律搜不到（用户报"列表里没有"）
+        let _searchTimer = null;
+        function debouncedSearchNodes() {
+            if (_searchTimer) clearTimeout(_searchTimer);
+            _searchTimer = setTimeout(() => loadNodes(true), 350);
         }
+        function filterNodes() { loadNodes(true); }   // 兼容旧调用
 
         function renderNodePage() {
             const pag = document.getElementById('nodes-pagination');
